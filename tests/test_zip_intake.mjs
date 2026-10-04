@@ -166,6 +166,17 @@ test("canonical hash deterministic reordered keys, Python Unicode order and safe
   assert.throws(() => validateReviewedManifest({...m, evidence: [{reference: "../secret", method: "explicit"}]}));
   assert.throws(() => validateReviewedManifest({...m, proposedPlacements: ["numbers"]}));
 });
+test("business requirement ports compare independent of object key order", async () => {
+  const {candidates: [m]} = await inspectZip(new Blob([
+    await readFile(new URL("fixtures/synthetic_modules.zip", import.meta.url))
+  ]));
+  const requirements = {
+    ...m.businessRequirements,
+    inputs: m.businessRequirements.inputs.map(({name, type}) => ({type, name})),
+    outputs: m.businessRequirements.outputs.map(({name, type}) => ({type, name}))
+  };
+  assert.doesNotThrow(() => validateReviewedManifest({...m, businessRequirements: requirements}));
+});
 test("v2 Unicode accepts emoji, rejects formatting/control characters and non-ASCII object keys", async () => {
   const {candidates: [m]} = await inspectZip(zip([explicitFile]));
   assert.equal(validateReviewedManifest({...m, purpose: "Synthetic emoji 🌱"}).purpose, "Synthetic emoji 🌱");
