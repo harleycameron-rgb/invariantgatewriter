@@ -25,10 +25,12 @@ code. A passing public test establishes only the properties actually tested:
 
 ## Connection status
 
-This repository did not contain the existing InvariantTap MCP host or a trusted
-qualification service. The connector is therefore **not a deployed or connected
-InvariantTap plugin**. Host coupling and qualification-service integration are
-separate steps, described below. Live writes are disabled by default.
+Repository inspection found no source, endpoint, configuration contract or
+credentials for the existing InvariantTap MCP host or trusted qualification
+service. The connector is therefore **not connected to either service** and is
+not a deployed InvariantTap plugin. No host or qualification-service request has
+been made. The six-tool adapter and trusted qualifier callback are implemented
+and tested locally; live writes remain disabled by default.
 
 Burn Harness is an optional future qualification route. Its interface has not
 been verified here; it is not connected and no Burn Harness run is claimed.
@@ -143,6 +145,13 @@ For deployment, choose a persistent SQLite database path writable only by the
 backend service account. Protect the database and its backups as receipt
 metadata. Configure the verifier, supported policy versions and authorization
 adapter on the backend; never obtain those settings from tool arguments.
+This repository does not define deployment environment-variable names or
+provide host/qualification-service credentials. Before connecting, the host
+owner must provide its repository or integration package, registrar and trusted
+request-context contract; the qualification-service owner must provide its
+service interface, accepted policy versions and secure backend signing-key
+provisioning. Do not enable `trusted_service_connected` until that actual service
+has been connected and its signed decisions verified end to end.
 
 The package exports `SQLiteStore`, `QualificationVerifier`, `GateWriter` and
 `register_gate_tools`. Construct a store with its database path and a verifier
@@ -461,6 +470,28 @@ This helper is not exposed by the public API/MCP process. Integrating it into th
 real host requires the host's authenticated transport and the actual trusted
 qualification-service interface. Its credentials, policy decisions and signing
 remain backend-only.
+
+### Portal bridge response contract
+
+The ZIP portal has a disconnected trusted-host bridge hook; it does not call the
+public module-test API for live admission. A deployment may inject executable
+backend bridge functions, but must not expose credentials or accept a pasted
+qualification envelope in the browser. `submit_reviewed_modules([item])` may
+return `{"atomic": false, "results": [result]}` (or the portal may receive the
+single result directly). For a confirmed placement, `result` must contain
+`status: "success"`, the matching `moduleId`, `qualificationId` and
+`moduleSHA512`, plus a `receipt` containing `gateId`, `receiptSHA512`, `x`,
+`y`, `layer`, `writtenAt` and boolean `duplicate`. The portal checks those fields
+against the reviewed declaration and event before rendering. Pending/rejected
+responses must not contain a confirmed receipt. Dry-run responses are previews,
+and self-test responses are labelled synthetic/test/isolated; neither can be
+rendered as a live placement.
+
+Local verification on 2026-10-04 ran `python -m unittest discover -s tests -v`
+and `node --test tests/test_zip_intake.mjs`. These isolated suites validate the
+adapter, qualification pipeline, receipt storage and portal contract; they do
+not establish a connection to the unavailable host or qualification service and
+do not represent live submissions.
 
 The local UI can display per-module synthetic success, pending and rejection,
 identity/placement rings, constraint evidence and the parabola projection.
