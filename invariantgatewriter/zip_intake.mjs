@@ -6,7 +6,7 @@ const sensitive = /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:password|passwd|secr
 const secretKey = /(?:password|passwd|secret|api[_-]?key|access[_-]?(?:token|key)|authorization|credentials?|private[_-]?key|(?:^|[_-])token$|^(?:env|environment)$)/i;
 const nested = /\.(?:zip|tar|gz|gzip|tgz|bz2|bzip2|xz|lzma|lz|7z|rar|jar|war|whl|zst|cab|iso|dmg|deb|rpm|apk|epub|docx|xlsx|pptx|odt|ods|odp)$/i;
 const excludedPath = /(?:^|\/)(?:\.env(?:[./]|$)|\.git(?:\/|$)|node_modules(?:\/|$)|vendor(?:\/|$)|\.ssh(?:\/|$)|\.aws(?:\/|$)|\.config(?:\/|$)|home(?:\/|$)|users?(?:\/|$)|private(?:\/|$)|personal(?:\/|$)|credentials?[^/]*|secrets?[^/]*|keys?(?:\.[^/]*)?|id_rsa[^/]*|id_ed25519[^/]*|[^/]*\.(?:pem|key|p12|pfx|jpg|jpeg|png|gif|mp4|mov|mp3|wav|pdf))$/i;
-const keys = ["schema", "moduleId", "version", "purpose", "inputs", "outputs", "constraints", "engineConnections", "syntheticTests", "dependencies", "proposedPlacements", "evidence", "extractionMethod", "unresolvedQuestions"];
+const keys = ["schema", "moduleId", "version", "purpose", "inputs", "outputs", "constraints", "engineConnections", "syntheticTests", "dependencies", "proposedPlacements", "evidence", "extractionMethod", "unresolvedQuestions", "businessRequirements"];
 const interfaces = {"identity/1": "identity", "numbers.add/1": "numbers", "text.concat/1": "text", "boolean.not/1": "boolean"};
 const contracts = {
   "identity/1": [{value: "string"}, {value: "string"}],
@@ -159,6 +159,8 @@ export function validateReviewedManifest(m) {
   };
   asciiKeys(m);
   if (m.schema !== "module-manifest/2" || typeof m.moduleId !== "string" || typeof m.version !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(m.moduleId) || !/^\d+\.\d+\.\d+$/.test(m.version) || typeof m.purpose !== "string" || !m.purpose || !["explicit-declaration", "package-boundary", "static-interface"].includes(m.extractionMethod)) fail();
+  object(m.businessRequirements, ["function", "inputs", "outputs", "acceptanceCases"]);
+  if (typeof m.businessRequirements.function !== "string" || !m.businessRequirements.function.trim() || canonicalJSON(m.businessRequirements.inputs) !== canonicalJSON(m.inputs) || canonicalJSON(m.businessRequirements.outputs) !== canonicalJSON(m.outputs) || !Array.isArray(m.businessRequirements.acceptanceCases) || m.businessRequirements.acceptanceCases.length > 64 || new Set(m.businessRequirements.acceptanceCases).size !== m.businessRequirements.acceptanceCases.length || m.businessRequirements.acceptanceCases.some(name => typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) || JSON.stringify(m.businessRequirements.acceptanceCases) !== JSON.stringify(m.syntheticTests.map(test => test.name))) fail();
   for (const field of ["inputs", "outputs"]) list(m[field], ["name", "type"]);
   const ports = values => {
     const names = new Set();
@@ -228,8 +230,16 @@ function explicit(raw, path) {
     constraints: raw.constraints ?? [], engineConnections: raw.engineConnections ?? [], syntheticTests: raw.syntheticTests ?? [],
     dependencies: raw.dependencies ?? [], proposedPlacements: [],
     evidence: evidencePath(path) ? [{reference: path, method: "explicit-declaration"}] : [],
-    extractionMethod: "explicit-declaration", unresolvedQuestions: questions
+    extractionMethod: "explicit-declaration", unresolvedQuestions: questions,
+    businessRequirements: raw.businessRequirements ?? {
+      function: raw.purpose || "Function not declared",
+      inputs: raw.inputs ?? [],
+      outputs: raw.outputs ?? [],
+      acceptanceCases: (raw.syntheticTests ?? []).map(test => test.name)
+    }
   };
+  if (!m.businessRequirements.function || m.businessRequirements.function === "Function not declared") questions.push("What business function must this module perform?");
+  if (!m.businessRequirements.acceptanceCases.length) questions.push("What business acceptance cases must pass?");
   m.proposedPlacements = [...new Set(m.engineConnections.filter(supportedConnection).map(c => interfaces[c.interface]))];
   return validateReviewedManifest(m);
 }
@@ -250,7 +260,7 @@ function inferred(raw, path, toml = false) {
       deps.push({moduleId, version});
     }
   }
-  return validateReviewedManifest({schema: "module-manifest/2", moduleId, version: knownVersion ? raw.version : "0.0.0", purpose: "Purpose not declared", inputs: [], outputs: [], constraints: [], engineConnections: [], syntheticTests: [], dependencies: deps, proposedPlacements: [], evidence: evidencePath(path) ? [{reference: path, method: "package-boundary"}] : [], extractionMethod: "package-boundary", unresolvedQuestions: questions});
+  return validateReviewedManifest({schema: "module-manifest/2", moduleId, version: knownVersion ? raw.version : "0.0.0", purpose: "Purpose not declared", inputs: [], outputs: [], constraints: [], engineConnections: [], syntheticTests: [], dependencies: deps, proposedPlacements: [], evidence: evidencePath(path) ? [{reference: path, method: "package-boundary"}] : [], extractionMethod: "package-boundary", unresolvedQuestions: [...questions, "What business function must this module perform?", "What business acceptance cases must pass?"], businessRequirements: {function: "Function not declared", inputs: [], outputs: [], acceptanceCases: []}});
 }
 function extract(texts, exclusions) {
   const groups = [], occupied = new Set();

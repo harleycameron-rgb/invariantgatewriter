@@ -6,18 +6,21 @@ import base64
 import hashlib
 import json
 import math
+import os
 import re
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
 
 
 MAX_BODY = 65536
+MAX_TEST_EVENTS = 4096
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII)
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z", re.ASCII)
+EVENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 TYPES = ("string", "number", "integer", "boolean")
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 INTERFACES = {
@@ -257,6 +260,8 @@ class PublicModuleNode:
                  available_dependencies=None, engine_catalog=None):
         self.limiter = limiter if limiter is not None else RateLimiter()
         self.client_identity = client_identity
+        self._event_records = OrderedDict()
+        self._event_lock = threading.Lock()
         if available_dependencies is not None:
             _require(type(available_dependencies) is dict, "Invalid backend dependency configuration.")
             self.available_dependencies = copy.deepcopy(available_dependencies)
@@ -270,7 +275,14 @@ class PublicModuleNode:
         _require(type(identity) is str and 1 <= len(identity) <= 256, "Invalid trusted client identity.")
         _require(self.limiter.allow(identity), "Rate limit exceeded.")
 
-    def _run(self, action, manifest):
+    def _run(self, action, manifest, event_id=None):
+        if event_id is not None and (action != "test" or type(event_id) is not str
+                                     or EVENT_ID.fullmatch(event_id) is None):
+            return {"valid": False, "errors": ["Invalid synthetic event ID."],
+                    "liveAdmission": False, "syntheticReceipt": {
+                        "schema": "module-synthetic-receipt/2", "synthetic": True,
+                        "signed": False, "liveAdmission": False, "status": "invalid",
+                        "tests": [], "scope": {"execution": "not_run"}}}
         try:
             digest = _validate(manifest)
         except (PublicNodeError, RecursionError) as error:
@@ -279,7 +291,8 @@ class PublicModuleNode:
                 "valid": False, "errors": [reason], "constraints": [], "connections": [],
                 "unresolvedConstraints": [], "liveAdmission": False,
                 "syntheticReceipt": {
-                    "schema": "module-synthetic-receipt/1", "synthetic": True,
+                    "schema": "module-synthetic-receipt/2", "synthetic": True,
+                    "signed": False,
                     "liveAdmission": False, "status": "invalid", "tests": [],
                     "scope": {"execution": "not_run", "moduleImplementationExecuted": False,
                               "moduleDeclaredIOExecuted": False, "testedConnections": [],
@@ -287,6 +300,17 @@ class PublicModuleNode:
                               "unresolvedConstraints": []},
                 },
             }
+        if event_id is not None:
+            with self._event_lock:
+                prior = self._event_records.get(event_id)
+                if prior is not None and prior[0] != digest:
+                    return {"valid": False, "errors": ["Synthetic event ID content conflict."],
+                            "errorCode": "event_id_conflict", "declarationSha512": digest,
+                            "liveAdmission": False, "syntheticReceipt": {
+                                "schema": "module-synthetic-receipt/2", "synthetic": True,
+                                "signed": False, "liveAdmission": False, "status": "rejected",
+                                "eventId": event_id, "tests": [],
+                                "scope": {"execution": "not_run"}}}
         constraints = _constraint_findings(manifest)
         findings = _connection_findings(manifest)
         result = {"valid": True, "schema": manifest["schema"], "declarationSha512": digest,
@@ -305,12 +329,15 @@ class PublicModuleNode:
             scope["placementAssessmentIncluded"] = False
             scope["placementConstraints"] = "Evaluated separately in top-level status and topology evidence."
         result["syntheticReceipt"] = {
-            "schema": "module-synthetic-receipt/1", "declarationSha512": digest,
-            "synthetic": True, "liveAdmission": False, "status": "not_run",
+            "schema": "module-synthetic-receipt/2", "declarationSha512": digest,
+            "eventId": event_id, "synthetic": True, "signed": False,
+            "liveAdmission": False, "status": "not_run",
             "scope": scope, "tests": [],
         }
         if action != "test":
-            return self._assessment(manifest, digest, result)
+            self._assessment(manifest, digest, result)
+            return result
+
         by_name = {c["name"]: c for c in manifest["engineConnections"]}
         statuses = {c["name"]: c["status"] for c in findings}
         tests = []
@@ -356,7 +383,57 @@ class PublicModuleNode:
         scope["syntheticAssertions"] = ["connection port signatures", "expected output equality"]
         result["syntheticReceipt"]["status"] = "failed" if failed else "incomplete" if incomplete else "passed"
         result["syntheticReceipt"]["tests"] = tests
-        return self._assessment(manifest, digest, result)
+        self._assessment(manifest, digest, result)
+        self._bind_synthetic_receipt(manifest, digest, event_id, result)
+        if event_id is not None:
+            receipt = result["syntheticReceipt"]
+            with self._event_lock:
+                prior = self._event_records.get(event_id)
+                if prior is not None:
+                    if prior != (digest, receipt["receiptSha512"]):
+                        return {"valid": False, "errors": ["Synthetic event ID content conflict."],
+                                "errorCode": "event_id_conflict", "declarationSha512": digest,
+                                "liveAdmission": False, "syntheticReceipt": {
+                                    "schema": "module-synthetic-receipt/2", "synthetic": True,
+                                    "signed": False, "liveAdmission": False, "status": "rejected",
+                                    "eventId": event_id, "tests": [],
+                                    "scope": {"execution": "not_run"}}}
+                    self._event_records.move_to_end(event_id)
+                    receipt["duplicate"] = True
+                else:
+                    if len(self._event_records) >= MAX_TEST_EVENTS:
+                        self._event_records.popitem(last=False)
+                    self._event_records[event_id] = (digest, receipt["receiptSha512"])
+                    receipt["duplicate"] = False
+        return result
+
+    @staticmethod
+    def _bind_synthetic_receipt(manifest, digest, event_id, result):
+        receipt = result["syntheticReceipt"]
+        requirements = manifest.get("businessRequirements", {
+            "function": manifest["purpose"],
+            "inputs": manifest["inputs"],
+            "outputs": manifest["outputs"],
+            "acceptanceCases": [test["name"] for test in manifest["syntheticTests"]],
+        })
+        body = {
+            "schema": receipt["schema"], "eventId": event_id,
+            "moduleId": manifest["moduleId"], "declarationSha512": digest,
+            "requirements": requirements, "evidence": manifest.get("evidence", []),
+            "resolvedTopology": {
+                "status": result.get("status"),
+                "identityRing": result.get("identityRing"),
+                "placementRing": result.get("placementRing"),
+                "assessmentEvidence": result.get("evidence"),
+            },
+            "status": receipt["status"], "tests": receipt["tests"],
+            "scope": receipt["scope"], "synthetic": True, "signed": False,
+            "liveAdmission": False,
+        }
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, allow_nan=False).encode("utf-8")
+        receipt.update(body)
+        receipt["receiptSha512"] = hashlib.sha512(canonical).hexdigest()
 
     def _assessment(self, manifest, digest, result):
         if manifest["schema"] == "module-manifest/2":
@@ -379,9 +456,9 @@ class PublicModuleNode:
         self._charge()
         return self._run("validate", manifest)
 
-    def droppoint_module_test(self, manifest):
+    def droppoint_module_test(self, manifest, event_id=None):
         self._charge()
-        return self._run("test", manifest)
+        return self._run("test", manifest, event_id)
 
     def droppoint_module_connections(self, manifest):
         self._charge()
@@ -409,7 +486,7 @@ def register_module_tools(host, node):
 TOOL_NAMES = ("droppoint_module_validate", "droppoint_module_test", "droppoint_module_connections")
 TOOL_DESCRIPTIONS = {
     "droppoint_module_validate": "Validate a transient public module declaration; never authorize live admission.",
-    "droppoint_module_test": "Run builtin synthetic module tests and return a transient non-admission receipt.",
+    "droppoint_module_test": "Run builtin acceptance tests; optional eventId enables process-local retry deduplication.",
     "droppoint_module_connections": "Check declared builtin engine signatures; unknown interfaces remain unresolved.",
 }
 _default_node = PublicModuleNode()
@@ -419,8 +496,8 @@ def droppoint_module_validate(manifest):
     return _default_node.droppoint_module_validate(manifest)
 
 
-def droppoint_module_test(manifest):
-    return _default_node.droppoint_module_test(manifest)
+def droppoint_module_test(manifest, event_id=None):
+    return _default_node.droppoint_module_test(manifest, event_id)
 
 
 def droppoint_module_connections(manifest):
@@ -482,7 +559,7 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         pass
 
 
-def _manifest_input_schema():
+def _manifest_input_schema(*, event_id=False):
     definitions = {}
     for version, filename in (("v1", "module_manifest.schema.json"),
                               ("v2", "module_manifest_v2.schema.json")):
@@ -500,9 +577,15 @@ def _manifest_input_schema():
             return value
 
         definitions[version] = relocate(schema)
+    properties = {"manifest": {"oneOf": [
+        {"$ref": "#/$defs/v1"}, {"$ref": "#/$defs/v2"}]}}
+    if event_id:
+        properties["eventId"] = {
+            "type": "string", "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?![\\s\\S])",
+        }
     return {"type": "object", "required": ["manifest"], "additionalProperties": False,
-            "$defs": definitions, "properties": {"manifest": {"oneOf": [
-                {"$ref": "#/$defs/v1"}, {"$ref": "#/$defs/v2"}]}}}
+            "$defs": definitions, "properties": properties}
 
 
 class _InlineAssetParser(HTMLParser):
@@ -662,7 +745,15 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
             if self.path == "/mcp":
                 self._mcp(request)
             else:
-                self._send(200, node._run(self.path.rsplit("/", 1)[1], request))
+                event_id = None
+                manifest = request
+                if self.path == "/api/test" and type(request) is dict and "manifest" in request:
+                    if set(request) - {"manifest", "eventId"}:
+                        self._send(400, {"error": "Invalid synthetic test request."})
+                        return
+                    manifest = request["manifest"]
+                    event_id = request.get("eventId")
+                self._send(200, node._run(self.path.rsplit("/", 1)[1], manifest, event_id))
 
         def _mcp(self, request):
             request_id = request.get("id") if type(request) is dict else None
@@ -705,14 +796,18 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
                 result = {}
             elif method == "tools/list" and not params:
                 result = {"tools": [{"name": name, "description": TOOL_DESCRIPTIONS[name],
-                                    "inputSchema": _manifest_input_schema()}
+                                    "inputSchema": _manifest_input_schema(event_id=name == "droppoint_module_test")}
                                    for name in TOOL_NAMES]}
             elif method == "tools/call":
                 if (set(params) != {"name", "arguments"} or params["name"] not in TOOL_NAMES
-                        or type(params["arguments"]) is not dict or set(params["arguments"]) != {"manifest"}):
+                        or type(params["arguments"]) is not dict
+                        or "manifest" not in params["arguments"]
+                        or set(params["arguments"]) - ({"manifest", "eventId"}
+                            if params["name"] == "droppoint_module_test" else {"manifest"})):
                     error(-32602, "Invalid params")
                     return
-                value = node._run(params["name"].removeprefix("droppoint_module_"), params["arguments"]["manifest"])
+                value = node._run(params["name"].removeprefix("droppoint_module_"),
+                                  params["arguments"]["manifest"], params["arguments"].get("eventId"))
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, allow_nan=False)}],
                           "structuredContent": value, "isError": not value["valid"]}
             else:
@@ -747,14 +842,20 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--host", default=os.environ.get("PUBLIC_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
     parser.add_argument("--allowed-host", action="append", help="Allowed Host authority; repeat for multiple values.")
     parser.add_argument("--allowed-origin", action="append", help="Allowed browser origin; repeat for multiple values.")
     parser.add_argument("--max-connections", type=int, default=32)
     args = parser.parse_args()
-    server = create_server(args.host, args.port, allowed_hosts=args.allowed_host,
-                           allowed_origins=args.allowed_origin, max_connections=args.max_connections)
+    hosts = args.allowed_host
+    origins = args.allowed_origin
+    if hosts is None and "PUBLIC_ALLOWED_HOSTS" in os.environ:
+        hosts = os.environ["PUBLIC_ALLOWED_HOSTS"].split(",")
+    if origins is None and "PUBLIC_ALLOWED_ORIGINS" in os.environ:
+        origins = os.environ["PUBLIC_ALLOWED_ORIGINS"].split(",")
+    server = create_server(args.host, args.port, allowed_hosts=hosts,
+                           allowed_origins=origins, max_connections=args.max_connections)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
