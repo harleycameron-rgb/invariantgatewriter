@@ -487,8 +487,9 @@ responses must not contain a confirmed receipt. Dry-run responses are previews,
 and self-test responses are labelled synthetic/test/isolated; neither can be
 rendered as a live placement.
 
-Local verification on 2026-10-04 ran `python -m unittest discover -s tests -v`
-and `node --test tests/test_zip_intake.mjs`. These isolated suites validate the
+Local verification on 2026-10-04 passed: 105 Python tests via
+`python -m unittest discover -s tests -v` and 22 Node.js tests via
+`node --test tests/test_zip_intake.mjs`. These isolated suites validate the
 adapter, qualification pipeline, receipt storage and portal contract; they do
 not establish a connection to the unavailable host or qualification service and
 do not represent live submissions.
