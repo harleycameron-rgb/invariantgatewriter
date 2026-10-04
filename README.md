@@ -1,13 +1,15 @@
-# InvariantTap gate writer
+# Standalone module test surface and optional gate writer
 
-Backend receipt storage and a host-registration adapter for the InvariantTap /
-DROPPOINT gate. Only trusted, backend-qualified submissions belong in the live
-gate; a module hash or browser-reported acceptance is not qualification.
+The public module test node runs independently. The repository also contains an
+optional backend gate writer; it is not required by the standalone module or
+business-test surface.
 
 The public module test node is a separate entry point for declarative manifests.
 It validates declarations and runs predefined synthetic operations, not uploaded
-code. A passing public test establishes only the properties actually tested:
-**live admission still requires the gate's qualification policy**.
+code. Its receipts are synthetic, unsigned and never enable live gate admission.
+
+To collaborate on this repository with ChatGPT, open
+[ChatGPT Codex](https://chatgpt.com/codex) and connect this GitHub repository.
 
 ### Contents
 
@@ -20,14 +22,18 @@ code. A passing public test establishes only the properties actually tested:
 - [Qualification-service connection](#qualification-service-connection)
 - [Public module test node](#public-module-test-node)
 - [Local ZIP inspection and module extraction](#local-zip-inspection-and-module-extraction)
-- [Identity, placement and convergence](#identity-placement-and-convergence)
-- [Multiple qualification events](#multiple-qualification-events)
+- [Business requirements and candidate matching](#business-requirements-and-candidate-matching)
+- [Synthetic receipts and deployment status](#synthetic-receipts-and-deployment-status)
 
 ## Connection status
 
+The public module node is a standalone service and does not depend on an
+InvariantTap host or qualification service. The optional gate writer remains a
+separate library.
+
 Repository inspection found no source, endpoint, configuration contract or
 credentials for the existing InvariantTap MCP host or trusted qualification
-service. The connector is therefore **not connected to either service** and is
+service. The gate writer is therefore **not connected to either service** and is
 not a deployed InvariantTap plugin. No host or qualification-service request has
 been made. The six-tool adapter and trusted qualifier callback are implemented
 and tested locally; live writes remain disabled by default.
@@ -282,10 +288,11 @@ not a trusted qualification signature.
 
 ### Public deployment
 
-**Publishing the GitHub repository does not run the test node.** A backend
-process must be started and maintained separately. The public service must not
-expose the gate writer or signing credentials. Keep gate authentication and
-qualification behind their separate trusted backend boundaries.
+The standalone surface is `python -m invariantgatewriter.public_node`. It serves
+the declaration form at `/`, browser-local ZIP inspection at `/zip`, REST routes
+at `/api/validate`, `/api/connections` and `/api/test`, and the public test MCP
+tools at `/mcp`. It does not initialize live gate storage or expose live
+admission. InvariantTap is not a required host or qualification dependency.
 
 For Internet access, deploy behind a TLS reverse proxy, restrict backend network
 access to that proxy and apply additional edge rate/concurrency limits. The
@@ -294,10 +301,26 @@ trust arbitrary forwarded client-IP headers; only configure a trusted proxy
 integration after verifying its behavior. Disable body logging, analytics and
 request capture at the proxy as well as the application to preserve transient
 processing.
-The original InvariantTap host is unavailable here: its logging and retention
-have not been inspected. No broader host-wide zero-retention guarantee is made.
 
-Start the local browser/API service from the repository root:
+No hosting target or deployment configuration is present in this repository.
+The included Dockerfile runs the actual public-node entrypoint:
+
+```sh
+docker build -t invariantgatewriter .
+docker run --rm -p 8080:8080 \
+  -e PUBLIC_ALLOWED_HOSTS=localhost:8080 \
+  -e PUBLIC_ALLOWED_ORIGINS=http://localhost:8080 \
+  invariantgatewriter
+```
+
+Hosting platforms may supply `PORT`, `PUBLIC_ALLOWED_HOSTS` and
+`PUBLIC_ALLOWED_ORIGINS` as environment variables. The allowlists are exact,
+comma-separated values; they do not trust forwarded headers. For a public
+deployment, configure the actual public authority and HTTPS origin, terminate
+TLS at a trusted edge, and do not enable body capture. The container has no
+third-party runtime dependencies and runs as an unprivileged user.
+
+Or start the local browser/API service from the repository root:
 
 ```sh
 python -m invariantgatewriter.public_node --host 127.0.0.1 --port 8080
@@ -313,7 +336,8 @@ The MCP endpoint supports initialization, tool discovery and tool calls; it
 does not register or dispatch live gate tools.
 This anonymous service rejects authorization and cookie headers. Use a separate
 public hostname or remove unrelated cookies at the trusted reverse proxy; never
-forward gate credentials to the public node.
+forward gate credentials to the public node. ZIP archives and source files are
+read in the browser and are never uploaded.
 
 Python callers can import `PublicModuleNode`, `RateLimiter` and
 `register_module_tools` from `invariantgatewriter.public_node`. Register public
@@ -327,6 +351,13 @@ authorization context.
 Requests are limited to 64 KiB. Default limits are 60 requests per client per
 minute and 300 globally per minute. Client identification uses the peer address,
 not untrusted `X-Forwarded-For`. Clients behind one proxy may share a quota.
+
+Synthetic test event IDs are deduplicated within one running process (up to 4096
+recent IDs); retries of retained events return the same receipt hash, while
+changed content under a retained event ID is rejected. When full, the least
+recently used ID is evicted. The registry retains only declaration and receipt
+hashes, not manifests, and is cleared on restart. It is not a cross-process or
+durable idempotency service.
 
 The HTTP server caps active connections at 32 and uses five-second socket
 timeouts. Configure `--allowed-host` and `--allowed-origin` (repeatable) for a
@@ -379,7 +410,12 @@ Do not include secrets or personal information in descriptions, contracts or
 evidence paths. Only reviewed declaration JSON is sent to the public test API.
 
 Version `module-manifest/2` adds `dependencies`, `proposedPlacements`, `evidence`,
-`extractionMethod` and `unresolvedQuestions` to the original declaration.
+`extractionMethod`, `unresolvedQuestions` and `businessRequirements` to the
+original declaration. Business requirements declare a function and name each
+acceptance case; those names must match synthetic test cases. The standalone
+form and ZIP review populate typed business inputs and outputs. Legacy v2 API
+declarations without this object remain supported by deriving it from the
+existing purpose, ports and synthetic tests.
 Version 1 remains supported for existing callers. The version 2 contract is
 [`module_manifest_v2.schema.json`](invariantgatewriter/module_manifest_v2.schema.json).
 Version 2 numeric values are safe JSON integers to keep browser and backend
@@ -387,52 +423,54 @@ canonicalization identical. The fingerprint identifies the reviewed declaration
 snapshot; it neither proves behavior nor independently describes the constraint
 architecture.
 
-## Identity, placement and convergence
+## Business requirements and candidate matching
 
-Two separate reports prevent confusing declaration identity with compatibility:
+Version 2 declarations bind a stable `moduleId` and full canonical declaration
+SHA-512 in `identityRing`. `businessRequirements` declares the function, typed
+inputs and outputs, and acceptance-case names; those ports must match the module
+contract, and case names must match declared synthetic tests. Connection
+signatures and test values are explicitly typed. Booleans are not integers.
 
-- **H:** module ID → canonical declaration SHA-512.
-- **P:** module ID → proposed engine placements and remaining feasible choices.
+Candidate placements are matched against the backend's local predefined interface
+catalog by exact input/output port names and types. Synthetic acceptance results
+and declared constraints narrow the finite feasible candidate set; response
+evidence records each before/after set. These built-ins are not remote deployments
+and do not establish production behavior. `pending` means required evidence or
+configuration is unresolved; `incompatible` means no candidate remains.
 
-These rings are not the gate coordinate allocator. A declaration fingerprint
-identifies a snapshot; `receiptSHA512` hashes a signed qualification body for a
-particular event and determines its gate coordinate. Different chronological
-events for the same declaration may therefore have different gate coordinates.
+No continuous parabola convergence is calculated or claimed. The standalone
+surface reports discrete candidate and evidence sets only. InvariantTap may be
+an optional upstream source of snapshots/history for a surrounding application;
+the public-node service neither requires that host nor changes its history.
 
-Placement checks compare declared connection interfaces, backend-known
-dependency availability, and inclusion/exclusion constraints. Results record
-evidence, unresolved conditions and each narrowing of the feasible set **K**.
-A hash alone never establishes physical contact, orbital compatibility or
-technology compatibility. Built-in engine interfaces are local synthetic
-implementations, not verified remote deployments.
+## Synthetic receipts and deployment status
 
-### Versioned parabola mapping
+Running acceptance tests returns an unsigned synthetic receipt labeled
+`module-synthetic-receipt/2`. Its SHA-512 binds the module identity, business
+requirements, declaration evidence, executed test results and resolved discrete
+topology. It is a content fingerprint, not a signature, qualification, live
+admission, stored gate receipt or proof that uploaded code ran. Only predefined
+synthetic operations run.
 
-`parabola-sha512/1` reads the first and second two-byte big-endian unsigned
-integers from the declaration digest and divides each by 65535 to obtain
-`alpha` and `beta`. Thus both coefficients are in [0, 1]:
+Each test event accepts an opaque `eventId`. Repeating the same retained ID and
+declaration returns the same receipt hash with `duplicate: true`; reusing it for
+changed content is rejected. The bounded least-recently-used index is
+process-local and retains only hashes. It is not durable across restart or shared
+across service replicas; oldest IDs may be evicted after 4096 unique events.
 
-- `P_A(x) = (1 + alpha) * x²`
-- `P_B(x) = (1 + beta) * x²`
-
-Both curves open **upward**, with vertex (0, 0). Writing `a = 1 + alpha` and
-`b = 1 + beta`, their foci are (0, 1/(4a)) and (0, 1/(4b)); directrices are
-`y = -1/(4a)` and `y = -1/(4b)`. These are abstract topology coordinates, not
-physical measurements.
-
-The sandbox is `-1 ≤ x ≤ 1` and `max(a*x², b*x²) ≤ y ≤ 1`.
-Its feasible horizontal range is `|x| ≤ sqrt(1/max(a,b))`.
-Equal coefficients produce coincident curves, not a unique convergence point.
-The UI draws only candidate curves, points and known receipts; it never allocates
-the gate's theoretical capacity.
+| Status | Result |
+| --- | --- |
+| Implemented | Standalone declaration form, business requirements, typed synthetic acceptance tests, browser-local ZIP inspection, candidate assessment and unsigned event receipts. |
+| Tested | Python regression suite and Node ZIP-intake suite (run from the repository root as documented above). |
+| Publicly deployed | No hosting target is configured in this repository and no hosting credentials/access were supplied. |
+| Live-admitted | No. Live gate admission remains disabled; no qualification service is invented or required for the standalone test surface. |
 
 Empty K means **incompatible**. Remaining unresolved conditions mean **pending**.
-A completion point is reported only after compatible interfaces, resolved
+A candidate is complete only after compatible interfaces, resolved
 dependencies/constraints, an explicit reviewed declaration and successful
-nonempty synthetic tests satisfy the documented resolution conditions.
-The common vertex may then represent completion; plotting it by itself proves
-nothing. Partial resolution is a legitimate result, and even local completion
-does not authorize a live gate write.
+nonempty synthetic tests satisfy the documented resolution conditions. Partial
+resolution is a legitimate result, and even local completion does not authorize
+a live gate write.
 
 In version 2 responses, top-level `status` is the placement/model assessment.
 `syntheticReceipt.status` describes the predefined test execution only. Successful
@@ -487,18 +525,18 @@ responses must not contain a confirmed receipt. Dry-run responses are previews,
 and self-test responses are labelled synthetic/test/isolated; neither can be
 rendered as a live placement.
 
-Local verification on 2026-10-04 passed: 105 Python tests via
-`python -m unittest discover -s tests -v` and 22 Node.js tests via
+Local verification on 2026-10-04 passed: 110 Python tests via
+`python -m unittest discover -s tests -v` and 23 Node.js tests via
 `node --test tests/test_zip_intake.mjs`. These isolated suites validate the
 adapter, qualification pipeline, receipt storage and portal contract; they do
 not establish a connection to the unavailable host or qualification service and
 do not represent live submissions.
 
 The local UI can display per-module synthetic success, pending and rejection,
-identity/placement rings, constraint evidence and the parabola projection.
-Receipt coordinates and stack layers are shown only after an actual successful
-write through a connected authenticated host bridge. Neither the trusted
-qualifier nor that live browser-to-host bridge is connected in this repository.
+discrete placement assessments and constraint evidence. Receipt coordinates and
+stack layers are shown only after an actual successful write through a connected
+authenticated host bridge. Neither the trusted qualifier nor that live
+browser-to-host bridge is connected in this repository.
 
 A deployment can inject the ZIP module's `configureTrustedHostBridge` with
 `qualify_reviewed_module(item)`, `droppoint_gate_dry_run(qualification)` and
@@ -511,3 +549,11 @@ browser signing function. Only a real qualified envelope reaches
 these callbacks or carry signing credentials. New-event/retry controls and
 receipt rendering stay disconnected until a trusted host integration supplies
 them.
+
+### Container deployment
+
+The Dockerfile packages the actual `public_node` entrypoint. The only remaining
+deployment prerequisite is access to a configured public hosting target (or a
+target selected by the repository owner) to build and run that container. Neither
+an InvariantTap integration nor qualification credentials are needed to host or
+use this service.
