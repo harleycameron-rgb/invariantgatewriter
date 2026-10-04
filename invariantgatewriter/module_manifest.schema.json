@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:invariantgatewriter:module-manifest:1",
+  "title": "Public module declaration, never a live admission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "moduleId", "version", "purpose", "inputs", "outputs", "constraints", "engineConnections", "syntheticTests"],
+  "properties": {
+    "schema": {"const": "module-manifest/1"},
+    "moduleId": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(?![\\s\\S])"},
+    "version": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?![\\s\\S])"},
+    "purpose": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "inputs": {"$ref": "#/$defs/ports"},
+    "outputs": {"$ref": "#/$defs/ports"},
+    "constraints": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["kind", "value"],
+        "properties": {
+          "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+          "value": {"type": ["string", "number", "boolean", "null"], "maxLength": 4096}
+        },
+        "allOf": [
+          {"if": {"properties": {"kind": {"enum": ["maxStringLength", "maxArrayLength"]}}}, "then": {"properties": {"value": {"type": "integer", "minimum": 0, "maximum": 4096}}}},
+          {"if": {"properties": {"kind": {"const": "nonNegativeNumbers"}}}, "then": {"properties": {"value": {"const": true}}}}
+        ]
+      }
+    },
+    "engineConnections": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "interface", "required", "inputs", "outputs"],
+        "properties": {
+          "name": {"$ref": "#/$defs/name"},
+          "interface": {"type": "string", "minLength": 1, "maxLength": 128},
+          "required": {"type": "boolean"},
+          "inputs": {"$ref": "#/$defs/ports"},
+          "outputs": {"$ref": "#/$defs/ports"}
+        }
+      }
+    },
+    "syntheticTests": {
+      "type": "array", "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "connection", "inputs", "expectedOutputs"],
+        "properties": {
+          "name": {"$ref": "#/$defs/name"},
+          "connection": {"$ref": "#/$defs/name"},
+          "inputs": {"$ref": "#/$defs/values"},
+          "expectedOutputs": {"$ref": "#/$defs/values"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "name": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(?![\\s\\S])"},
+    "ports": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["name", "type"],
+        "properties": {"name": {"$ref": "#/$defs/name"}, "type": {"enum": ["string", "number", "integer", "boolean"]}}
+      }
+    },
+    "values": {
+      "type": "object", "maxProperties": 32,
+      "propertyNames": {"$ref": "#/$defs/name"},
+      "additionalProperties": {"type": ["string", "number", "boolean"], "maxLength": 4096}
+    }
+  },
+  "$comment": "Additional semantic rules: names unique within each port list, connection list, and test list; test connections must be declared. Values match the declared connection port names and types (booleans are not numbers; integer values and integer constraint limits must use JSON integer syntax, not decimals/exponents). JSON must be finite, <=65536 UTF-8 bytes, <=12 nesting levels, <=4096 characters per string, <=64 items per array, <=32 properties per object, <=4096 total values including keys. maxStringLength and nonNegativeNumbers inspect synthetic inputs and expected/actual outputs and are unresolved without relevant values; maxArrayLength limits all port, connection and test declaration lists, excluding constraints. Unknown constraints and interfaces are unresolved, not passing evidence. Only backend builtin connection interfaces execute; module-level IO is declaration metadata, and no module implementation executes."
+}
