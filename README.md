@@ -29,7 +29,17 @@ To collaborate on this repository with ChatGPT, open
 
 The public module node is a standalone service and does not depend on an
 InvariantTap host or qualification service. The optional gate writer remains a
-separate library; live writes are disabled by default.
+separate library.
+
+Repository inspection found no source, endpoint, configuration contract or
+credentials for the existing InvariantTap MCP host or trusted qualification
+service. The gate writer is therefore **not connected to either service** and is
+not a deployed InvariantTap plugin. No host or qualification-service request has
+been made. The six-tool adapter and trusted qualifier callback are implemented
+and tested locally; live writes remain disabled by default.
+
+Burn Harness is an optional future qualification route. Its interface has not
+been verified here; it is not connected and no Burn Harness run is claimed.
 
 ## Gate model
 
@@ -141,6 +151,13 @@ For deployment, choose a persistent SQLite database path writable only by the
 backend service account. Protect the database and its backups as receipt
 metadata. Configure the verifier, supported policy versions and authorization
 adapter on the backend; never obtain those settings from tool arguments.
+This repository does not define deployment environment-variable names or
+provide host/qualification-service credentials. Before connecting, the host
+owner must provide its repository or integration package, registrar and trusted
+request-context contract; the qualification-service owner must provide its
+service interface, accepted policy versions and secure backend signing-key
+provisioning. Do not enable `trusted_service_connected` until that actual service
+has been connected and its signed decisions verified end to end.
 
 The package exports `SQLiteStore`, `QualificationVerifier`, `GateWriter` and
 `register_gate_tools`. Construct a store with its database path and a verifier
@@ -447,6 +464,93 @@ across service replicas; oldest IDs may be evicted after 4096 unique events.
 | Tested | Python regression suite and Node ZIP-intake suite (run from the repository root as documented above). |
 | Publicly deployed | No hosting target is configured in this repository and no hosting credentials/access were supplied. |
 | Live-admitted | No. Live gate admission remains disabled; no qualification service is invented or required for the standalone test surface. |
+
+Empty K means **incompatible**. Remaining unresolved conditions mean **pending**.
+A candidate is complete only after compatible interfaces, resolved
+dependencies/constraints, an explicit reviewed declaration and successful
+nonempty synthetic tests satisfy the documented resolution conditions. Partial
+resolution is a legitimate result, and even local completion does not authorize
+a live gate write.
+
+In version 2 responses, top-level `status` is the placement/model assessment.
+`syntheticReceipt.status` describes the predefined test execution only. Successful
+builtin tests do not override a pending dependency or an incompatible placement.
+Configure dependency availability and engine catalogs only in backend node
+configuration; manifest claims are not proof that a dependency is deployed.
+
+## Multiple qualification events
+
+Several candidates from one ZIP are assessed independently. A backend trusted
+qualification service must decide live admission per candidate; the browser and
+public node cannot issue live qualifications. No fixture or synthetic-test
+receipt is promoted to a live qualification.
+
+Use one stable opaque qualification event ID per module/event and reuse it for
+retries. A new chronological event needs a new ID; declaration identity is its
+fingerprint, not its event ID. Retry deduplication and event-content conflicts
+remain enforced by the existing transactional gate writer.
+The qualifier must return the same qualification body for an event retry,
+including its timestamps; changing the body under an existing event ID is a
+conflict. Expired qualifications remain invalid, even for duplicates. A genuinely
+new qualification event uses a new event ID rather than silently rewriting one.
+
+For a connected backend, import `submit_reviewed_modules` from
+`invariantgatewriter.qualification`. Supply 1–100 items containing `declaration`
+and `qualificationId`, plus the writer, backend-only qualifier, authorization
+callback and trusted caller context. The callback must authenticate and grant
+`gate:write`. The qualifier returns a signed qualification or a pending/rejected
+decision; the helper binds its event ID and module hash to the reviewed snapshot
+before invoking the gate writer. Missing qualifiers return pending, not invented
+acceptance. Each item returns success with a placement, pending, or rejection;
+successful items remain committed if others fail.
+
+This helper is not exposed by the public API/MCP process. Integrating it into the
+real host requires the host's authenticated transport and the actual trusted
+qualification-service interface. Its credentials, policy decisions and signing
+remain backend-only.
+
+### Portal bridge response contract
+
+The ZIP portal has a disconnected trusted-host bridge hook; it does not call the
+public module-test API for live admission. A deployment may inject executable
+backend bridge functions, but must not expose credentials or accept a pasted
+qualification envelope in the browser. `submit_reviewed_modules([item])` may
+return `{"atomic": false, "results": [result]}` (or the portal may receive the
+single result directly). For a confirmed placement, `result` must contain
+`status: "success"`, the matching `moduleId`, `qualificationId` and
+`moduleSHA512`, plus a `receipt` containing `gateId`, `receiptSHA512`, `x`,
+`y`, `layer`, `writtenAt` and boolean `duplicate`. The portal checks those fields
+against the reviewed declaration and event before rendering. Pending/rejected
+responses must not contain a confirmed receipt. Dry-run responses are previews,
+and self-test responses are labelled synthetic/test/isolated; neither can be
+rendered as a live placement.
+
+Local verification on 2026-10-04 passed: 110 Python tests via
+`python -m unittest discover -s tests -v` and 23 Node.js tests via
+`node --test tests/test_zip_intake.mjs`. These isolated suites validate the
+adapter, qualification pipeline, receipt storage and portal contract; they do
+not establish a connection to the unavailable host or qualification service and
+do not represent live submissions.
+
+The local UI can display per-module synthetic success, pending and rejection,
+discrete placement assessments and constraint evidence. Receipt coordinates and
+stack layers are shown only after an actual successful write through a connected
+authenticated host bridge. Neither the trusted qualifier nor that live
+browser-to-host bridge is connected in this repository.
+
+A deployment can inject the ZIP module's `configureTrustedHostBridge` with
+`qualify_reviewed_module(item)`, `droppoint_gate_dry_run(qualification)` and
+`submit_reviewed_modules(items)` callbacks.
+Each item contains the reviewed `declaration` and stable `qualificationId`.
+The qualifier callback calls the actual trusted backend policy service and
+returns a qualified envelope or a pending/rejected decision; it is not a
+browser signing function. Only a real qualified envelope reaches
+`droppoint_gate_dry_run(qualification)`. The public service does not implement
+these callbacks or carry signing credentials. New-event/retry controls and
+receipt rendering stay disconnected until a trusted host integration supplies
+them.
+
+### Container deployment
 
 The Dockerfile packages the actual `public_node` entrypoint. The only remaining
 deployment prerequisite is access to a configured public hosting target (or a
