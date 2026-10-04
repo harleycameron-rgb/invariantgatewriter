@@ -1,6 +1,8 @@
 """Transient public declaration checks and synthetic tests; no gate or storage."""
 
 import argparse
+import copy
+import base64
 import hashlib
 import json
 import math
@@ -110,6 +112,13 @@ def _values(values, ports):
 
 
 def _validate(manifest):
+    if type(manifest) is dict and manifest.get("schema") == "module-manifest/2":
+        from .topology import validate_declaration
+        return validate_declaration(manifest)
+    return _validate_v1(manifest)
+
+
+def _validate_v1(manifest):
     canonical = _bounded(manifest)
     _object(manifest, ("schema", "moduleId", "version", "purpose", "inputs", "outputs",
                        "constraints", "engineConnections", "syntheticTests"))
@@ -162,7 +171,11 @@ def _constraint_findings(manifest, actual=None):
     for constraint in manifest["constraints"]:
         kind, limit = constraint["kind"], constraint["value"]
         if kind == "maxStringLength":
-            passed = all(len(v) <= limit for v in values if type(v) is str)
+            relevant = [v for v in values if type(v) is str]
+            if not relevant:
+                findings.append({"kind": kind, "status": "unresolved"})
+                continue
+            passed = all(len(v) <= limit for v in relevant)
         elif kind == "maxArrayLength":
             arrays = [manifest[field] for field in
                       ("inputs", "outputs", "engineConnections", "syntheticTests")]
@@ -170,7 +183,13 @@ def _constraint_findings(manifest, actual=None):
                           for field in ("inputs", "outputs"))
             passed = all(len(array) <= limit for array in arrays)
         elif kind == "nonNegativeNumbers":
-            passed = all(v >= 0 for v in values if type(v) in (int, float))
+            relevant = [v for v in values if type(v) in (int, float)]
+            if not relevant:
+                findings.append({"kind": kind, "status": "unresolved"})
+                continue
+            passed = all(v >= 0 for v in relevant)
+        elif kind in ("includeEngine", "excludeEngine") and manifest["schema"] == "module-manifest/2":
+            passed = True
         else:
             findings.append({"kind": kind, "status": "unresolved"})
             continue
@@ -220,9 +239,16 @@ class RateLimiter:
 class PublicModuleNode:
     """Identity is supplied by trusted transport context, never manifest arguments."""
 
-    def __init__(self, limiter=None, client_identity=None):
+    def __init__(self, limiter=None, client_identity=None, *,
+                 available_dependencies=None, engine_catalog=None):
         self.limiter = limiter if limiter is not None else RateLimiter()
         self.client_identity = client_identity
+        if available_dependencies is not None:
+            _require(type(available_dependencies) is dict, "Invalid backend dependency configuration.")
+            self.available_dependencies = copy.deepcopy(available_dependencies)
+        if engine_catalog is not None:
+            _require(type(engine_catalog) is dict, "Invalid backend engine configuration.")
+            self.engine_catalog = copy.deepcopy(engine_catalog)
 
     def _charge(self, identity=None):
         if identity is None:
@@ -233,18 +259,40 @@ class PublicModuleNode:
     def _run(self, action, manifest):
         try:
             digest = _validate(manifest)
-        except (PublicNodeError, RecursionError):
-            return {"valid": False, "errors": ["Invalid or oversized module manifest."],
-                    "liveAdmission": False}
+        except (PublicNodeError, RecursionError) as error:
+            reason = str(error) if isinstance(error, PublicNodeError) else "Declaration complexity limit exceeded."
+            return {
+                "valid": False, "errors": [reason], "constraints": [], "connections": [],
+                "unresolvedConstraints": [], "liveAdmission": False,
+                "syntheticReceipt": {
+                    "schema": "module-synthetic-receipt/1", "synthetic": True,
+                    "liveAdmission": False, "status": "invalid", "tests": [],
+                    "scope": {"execution": "not_run", "moduleImplementationExecuted": False,
+                              "moduleDeclaredIOExecuted": False, "testedConnections": [],
+                              "syntheticAssertions": [], "checkedConstraints": [],
+                              "unresolvedConstraints": []},
+                },
+            }
         constraints = _constraint_findings(manifest)
-        result = {"valid": True, "schema": "module-manifest/1", "declarationSha512": digest,
-                  "constraints": constraints, "liveAdmission": False}
-        if action == "validate":
-            return result
         findings = _connection_findings(manifest)
-        result["connections"] = findings
-        if action == "connections":
-            return result
+        result = {"valid": True, "schema": manifest["schema"], "declarationSha512": digest,
+                  "constraints": constraints, "connections": findings,
+                  "unresolvedConstraints": [f for f in constraints if f["status"] == "unresolved"],
+                  "liveAdmission": False}
+        scope = {
+            "execution": "not_run", "moduleImplementationExecuted": False,
+            "moduleDeclaredIOExecuted": False, "testedConnections": [],
+            "syntheticAssertions": [],
+            "checkedConstraints": [f["kind"] for f in constraints if f["status"] != "unresolved"],
+            "unresolvedConstraints": [f["kind"] for f in constraints if f["status"] == "unresolved"],
+        }
+        result["syntheticReceipt"] = {
+            "schema": "module-synthetic-receipt/1", "declarationSha512": digest,
+            "synthetic": True, "liveAdmission": False, "status": "not_run",
+            "scope": scope, "tests": [],
+        }
+        if action != "test":
+            return self._assessment(manifest, digest, result)
         by_name = {c["name"]: c for c in manifest["engineConnections"]}
         statuses = {c["name"]: c["status"] for c in findings}
         tests = []
@@ -265,8 +313,17 @@ class PublicModuleNode:
                 else:
                     output = {"value": not inputs["value"]}
                 _bounded(output)
+                if manifest["schema"] == "module-manifest/2":
+                    from .topology import SAFE_INTEGER
+                    _require(all(type(value) not in (int, float) or
+                                 type(value) is int and abs(value) <= SAFE_INTEGER
+                                 for value in output.values()), "Unsafe synthetic output number.")
                 passed = output == test["expectedOutputs"]
-                passed = passed and all(f["status"] != "violated" for f in _constraint_findings(manifest, output))
+                actual_constraints = _constraint_findings(manifest, output)
+                passed = passed and all(f["status"] != "violated" for f in actual_constraints)
+                for aggregate, actual_finding in zip(constraints, actual_constraints):
+                    if actual_finding["status"] == "violated":
+                        aggregate["status"] = "violated"
                 tests.append({"name": test["name"], "status": "passed" if passed else "failed",
                               "actualOutputs": output})
             except (PublicNodeError, OverflowError):
@@ -275,12 +332,21 @@ class PublicModuleNode:
         incomplete = (not tests or any(t["status"] == "unresolved" for t in tests)
                       or any(c["status"] == "unresolved" for c in constraints)
                       or any(c["status"] != "compatible" for c in findings))
-        result["syntheticReceipt"] = {
-            "schema": "module-synthetic-receipt/1", "declarationSha512": digest,
-            "synthetic": True, "liveAdmission": False,
-            "status": "failed" if failed else "incomplete" if incomplete else "passed",
-            "tests": tests,
-        }
+        scope["execution"] = "backend-defined builtin connection interfaces only"
+        scope["testedConnections"] = sorted({test["connection"] for test in manifest["syntheticTests"]
+                                             if statuses[test["connection"]] == "compatible"})
+        scope["syntheticAssertions"] = ["connection port signatures", "expected output equality"]
+        result["syntheticReceipt"]["status"] = "failed" if failed else "incomplete" if incomplete else "passed"
+        result["syntheticReceipt"]["tests"] = tests
+        return self._assessment(manifest, digest, result)
+
+    def _assessment(self, manifest, digest, result):
+        if manifest["schema"] == "module-manifest/2":
+            from .topology import assess_declaration
+            result.update(assess_declaration(
+                manifest, digest, test_receipt=result["syntheticReceipt"],
+                available_dependencies=getattr(self, "available_dependencies", None),
+                engine_catalog=getattr(self, "engine_catalog", None)))
         return result
 
     def droppoint_module_validate(self, manifest):
@@ -401,6 +467,15 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
     """
     node = node if node is not None else PublicModuleNode()
     page = Path(__file__).with_name("public_node.html").read_bytes()
+    script = re.search(rb"<script>(.*?)</script>", page, re.DOTALL).group(1)
+    style = re.search(rb"<style>(.*?)</style>", page, re.DOTALL).group(1)
+    script_hash = base64.b64encode(hashlib.sha256(script).digest()).decode("ascii")
+    style_hash = base64.b64encode(hashlib.sha256(style).digest()).decode("ascii")
+    content_policy = (
+        f"default-src 'self'; script-src 'sha256-{script_hash}'; "
+        f"style-src 'sha256-{style_hash}'; connect-src 'self'; "
+        "frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"
+    )
     hosts = set()
     origins = set()
 
@@ -422,7 +497,7 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
+            self.send_header("Content-Security-Policy", content_policy)
             self.send_header("Connection", "close")
             if status == 429:
                 self.send_header("Retry-After", "60")
@@ -469,6 +544,11 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
                 return
             if self.path not in ("/mcp", "/api/validate", "/api/test", "/api/connections"):
                 self._send(404, {"error": "Not found."})
+                return
+            protocol_headers = self.headers.get_all("MCP-Protocol-Version", [])
+            if self.path == "/mcp" and protocol_headers and (
+                    len(protocol_headers) != 1 or protocol_headers[0] not in PROTOCOLS):
+                self._send(400, {"error": "Unsupported MCP protocol version."})
                 return
             lengths = self.headers.get_all("Content-Length", [])
             if self.headers.get("Transfer-Encoding") is not None or len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
@@ -582,8 +662,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--allowed-host", action="append", help="Allowed Host authority; repeat for multiple values.")
+    parser.add_argument("--allowed-origin", action="append", help="Allowed browser origin; repeat for multiple values.")
+    parser.add_argument("--max-connections", type=int, default=32)
     args = parser.parse_args()
-    server = create_server(args.host, args.port)
+    server = create_server(args.host, args.port, allowed_hosts=args.allowed_host,
+                           allowed_origins=args.allowed_origin, max_connections=args.max_connections)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

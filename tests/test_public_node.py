@@ -2,6 +2,7 @@ import copy
 import hashlib
 import http.client
 import json
+import re
 import socket
 import threading
 import time
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 from invariantgatewriter.public_node import (
     MAX_BODY, PublicModuleNode, PublicNodeError, RateLimiter, create_server,
-    register_module_tools,
+    main, register_module_tools,
 )
 
 
@@ -48,6 +49,8 @@ class ModuleTests(unittest.TestCase):
         self.assertNotEqual(self.node.droppoint_module_validate(value)["declarationSha512"],
                             result["declarationSha512"])
         self.assertNotIn("manifests", self.node.__dict__)
+        self.assertEqual(result["syntheticReceipt"]["status"], "not_run")
+        self.assertEqual(result["syntheticReceipt"]["declarationSha512"], result["declarationSha512"])
 
     def test_expected_outputs_are_asserted(self):
         value = manifest()
@@ -56,6 +59,10 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(receipt["tests"][0]["actualOutputs"], {"sum": 5})
         self.assertTrue(receipt["synthetic"])
         self.assertFalse(receipt["liveAdmission"])
+        self.assertFalse(receipt["scope"]["moduleImplementationExecuted"])
+        self.assertFalse(receipt["scope"]["moduleDeclaredIOExecuted"])
+        self.assertEqual(receipt["scope"]["testedConnections"], ["add"])
+        self.assertEqual(receipt["scope"]["checkedConstraints"], ["nonNegativeNumbers"])
         value["syntheticTests"][0]["expectedOutputs"]["sum"] = 6
         self.assertEqual(self.node.droppoint_module_test(value)["syntheticReceipt"]["status"], "failed")
 
@@ -99,7 +106,7 @@ class ModuleTests(unittest.TestCase):
         ]:
             with self.subTest(interface=interface):
                 value = manifest()
-                value["constraints"] = [{"kind": "maxStringLength", "value": 100}]
+                value["constraints"] = [{"kind": "maxStringLength", "value": 100}] if kind == "string" else []
                 connection = value["engineConnections"][0]
                 connection["interface"] = interface
                 connection["inputs"] = [{"name": name, "type": kind} for name in inputs]
@@ -110,6 +117,48 @@ class ModuleTests(unittest.TestCase):
                 if kind == "string":
                     value["constraints"][0]["value"] = 1
                     self.assertEqual(self.node.droppoint_module_test(value)["syntheticReceipt"]["status"], "failed")
+
+    def test_constraints_without_relevant_values_are_unresolved(self):
+        value = manifest()
+        value["constraints"] = [{"kind": "maxStringLength", "value": 100}]
+        result = self.node.droppoint_module_test(value)
+        self.assertEqual(result["constraints"][0]["status"], "unresolved")
+        self.assertEqual(result["unresolvedConstraints"], [{"kind": "maxStringLength", "status": "unresolved"}])
+        self.assertEqual(result["syntheticReceipt"]["status"], "incomplete")
+        self.assertEqual(result["syntheticReceipt"]["scope"]["checkedConstraints"], [])
+        self.assertEqual(result["syntheticReceipt"]["scope"]["unresolvedConstraints"], ["maxStringLength"])
+        value = manifest()
+        value["syntheticTests"] = []
+        result = self.node.droppoint_module_test(value)
+        self.assertEqual(result["constraints"][0]["status"], "unresolved")
+        self.assertEqual(result["syntheticReceipt"]["scope"]["testedConnections"], [])
+
+    def test_module_io_is_only_metadata_not_executed(self):
+        value = manifest()
+        value["inputs"] = [{"name": "unexecuted", "type": "boolean"}]
+        value["outputs"] = []
+        result = self.node.droppoint_module_test(value)
+        self.assertEqual(result["syntheticReceipt"]["status"], "passed")
+        self.assertFalse(result["syntheticReceipt"]["scope"]["moduleDeclaredIOExecuted"])
+
+    def test_every_operation_has_consistent_analysis_and_receipt(self):
+        value = manifest()
+        value["constraints"].append({"kind": "externalClaim", "value": True})
+        for action in ("validate", "connections", "test"):
+            result = getattr(self.node, "droppoint_module_" + action)(value)
+            self.assertEqual(result["connections"][0]["status"], "compatible")
+            self.assertEqual(result["unresolvedConstraints"], [{"kind": "externalClaim", "status": "unresolved"}])
+            receipt = result["syntheticReceipt"]
+            self.assertEqual(receipt["declarationSha512"], result["declarationSha512"])
+            self.assertEqual(receipt["status"], "incomplete" if action == "test" else "not_run")
+            if action != "test":
+                self.assertEqual(receipt["tests"], [])
+                self.assertEqual(receipt["scope"]["execution"], "not_run")
+            invalid = getattr(self.node, "droppoint_module_" + action)({})
+            self.assertEqual(invalid["errors"], ["Invalid object fields."])
+            self.assertEqual(invalid["syntheticReceipt"]["status"], "invalid")
+            self.assertNotIn("declarationSha512", invalid["syntheticReceipt"])
+            self.assertFalse(invalid["liveAdmission"])
 
     def test_empty_tests_never_pass(self):
         value = manifest()
@@ -263,6 +312,11 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["schema"]["const"], "module-manifest/1")
         self.assertEqual(set(schema["required"]), set(manifest()))
         self.assertFalse(schema["additionalProperties"])
+        for property_name in ("moduleId", "version"):
+            expression = schema["properties"][property_name]["pattern"]
+            valid = manifest()[property_name]
+            self.assertIsNotNone(re.search(expression, valid))
+            self.assertIsNone(re.search(expression, valid + "\n"))
 
     def test_no_live_writer_or_storage_is_initialized(self):
         with patch("invariantgatewriter.writer.GateWriter", side_effect=AssertionError("live writer")), \
@@ -271,6 +325,20 @@ class ModuleTests(unittest.TestCase):
             self.assertTrue(node.droppoint_module_test(manifest())["valid"])
             server = create_server(port=0, node=node)
             server.server_close()
+
+    def test_cli_passes_explicit_transport_settings(self):
+        arguments = [
+            "public_node", "--host", "127.0.0.1", "--port", "8080",
+            "--allowed-host", "public.example", "--allowed-host", "other.example",
+            "--allowed-origin", "https://public.example", "--max-connections", "16",
+        ]
+        with patch("sys.argv", arguments), patch("invariantgatewriter.public_node.create_server") as factory:
+            factory.return_value.serve_forever.side_effect = KeyboardInterrupt
+            main()
+            factory.assert_called_once_with(
+                "127.0.0.1", 8080, allowed_hosts=["public.example", "other.example"],
+                allowed_origins=["https://public.example"], max_connections=16)
+            factory.return_value.server_close.assert_called_once()
 
 
 class HTTPTests(unittest.TestCase):
@@ -414,6 +482,15 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertNotIn("unsafe-inline", headers["Content-Security-Policy"])
+        self.assertIn("sha256-", headers["Content-Security-Policy"])
+
+    def test_mcp_protocol_header_versions(self):
+        request = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        headers = {"Content-Type": "application/json", "MCP-Protocol-Version": "unsupported"}
+        self.assertEqual(self.request("/mcp", request, headers=headers)[0], 400)
+        headers["MCP-Protocol-Version"] = "2025-06-18"
+        self.assertEqual(self.request("/mcp", request, headers=headers)[0], 200)
 
     def test_configurable_allowlists_and_connection_budget(self):
         self.server.shutdown()

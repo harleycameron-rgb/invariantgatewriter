@@ -1,0 +1,32 @@
+{
+  "declared/droppoint.module.json": {
+    "modules": [
+      {
+        "schema": "module-manifest/1",
+        "moduleId": "synthetic.add",
+        "version": "1.0.0",
+        "purpose": "Add synthetic numbers",
+        "inputs": [{"name": "a", "type": "number"}, {"name": "b", "type": "number"}],
+        "outputs": [{"name": "sum", "type": "number"}],
+        "constraints": [],
+        "engineConnections": [{"name": "add", "interface": "numbers.add/1", "required": true, "inputs": [{"name": "a", "type": "number"}, {"name": "b", "type": "number"}], "outputs": [{"name": "sum", "type": "number"}]}],
+        "syntheticTests": [{"name": "two-plus-three", "connection": "add", "inputs": {"a": 2, "b": 3}, "expectedOutputs": {"sum": 5}}],
+        "dependencies": []
+      },
+      {
+        "schema": "module-manifest/1",
+        "moduleId": "synthetic.concat",
+        "version": "1.0.0",
+        "purpose": "Concatenate synthetic text",
+        "inputs": [{"name": "left", "type": "string"}, {"name": "right", "type": "string"}],
+        "outputs": [{"name": "result", "type": "string"}],
+        "constraints": [],
+        "engineConnections": [{"name": "concat", "interface": "text.concat/1", "required": true, "inputs": [{"name": "left", "type": "string"}, {"name": "right", "type": "string"}], "outputs": [{"name": "result", "type": "string"}]}],
+        "syntheticTests": [{"name": "join", "connection": "concat", "inputs": {"left": "hello", "right": "world"}, "expectedOutputs": {"result": "helloworld"}}],
+        "dependencies": []
+      }
+    ]
+  },
+  "declared/package.json": {"name": "synthetic.suppressed", "version": "1.0.0"},
+  "inferred/package.json": {"name": "synthetic.inferred"}
+}

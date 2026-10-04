@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:invariantgatewriter:module-manifest:2",
+  "title": "ZIP-derived declarative module topology, never a live admission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "moduleId", "version", "purpose", "inputs", "outputs", "constraints", "engineConnections", "syntheticTests", "dependencies", "proposedPlacements", "evidence", "extractionMethod", "unresolvedQuestions"],
+  "properties": {
+    "schema": {"const": "module-manifest/2"},
+    "moduleId": {"$ref": "#/$defs/name"},
+    "version": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?![\\s\\S])"},
+    "purpose": {"allOf": [{"$ref": "#/$defs/text"}, {"minLength": 1}]},
+    "inputs": {"$ref": "#/$defs/ports"},
+    "outputs": {"$ref": "#/$defs/ports"},
+    "constraints": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["kind", "value"],
+        "properties": {
+          "kind": {"allOf": [{"$ref": "#/$defs/text"}, {"minLength": 1, "maxLength": 128}]},
+          "value": {"anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/integer"}, {"type": ["boolean", "null"]}]}
+        },
+        "allOf": [
+          {"if": {"properties": {"kind": {"enum": ["maxStringLength", "maxArrayLength"]}}}, "then": {"properties": {"value": {"type": "integer", "minimum": 0, "maximum": 4096}}}},
+          {"if": {"properties": {"kind": {"const": "nonNegativeNumbers"}}}, "then": {"properties": {"value": {"const": true}}}},
+          {"if": {"properties": {"kind": {"enum": ["includeEngine", "excludeEngine"]}}}, "then": {"properties": {"value": {"$ref": "#/$defs/name"}}}}
+        ]
+      }
+    },
+    "engineConnections": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "interface", "required", "inputs", "outputs"],
+        "properties": {
+          "name": {"$ref": "#/$defs/name"},
+          "interface": {"allOf": [{"$ref": "#/$defs/text"}, {"minLength": 1, "maxLength": 128}]},
+          "required": {"type": "boolean"},
+          "inputs": {"$ref": "#/$defs/ports"},
+          "outputs": {"$ref": "#/$defs/ports"}
+        }
+      }
+    },
+    "syntheticTests": {
+      "type": "array", "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "connection", "inputs", "expectedOutputs"],
+        "properties": {
+          "name": {"$ref": "#/$defs/name"}, "connection": {"$ref": "#/$defs/name"},
+          "inputs": {"$ref": "#/$defs/values"}, "expectedOutputs": {"$ref": "#/$defs/values"}
+        }
+      }
+    },
+    "dependencies": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["moduleId", "version"],
+        "properties": {
+          "moduleId": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?:@[A-Za-z0-9._-]+/)?[A-Za-z0-9][A-Za-z0-9._-]*(?![\\s\\S])", "not": {"pattern": "\\.\\."}},
+          "version": {"allOf": [{"$ref": "#/$defs/text"}, {"minLength": 1, "maxLength": 128}]}
+        }
+      }
+    },
+    "proposedPlacements": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"$ref": "#/$defs/name"}},
+    "evidence": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["reference", "method"],
+        "properties": {
+          "reference": {
+            "allOf": [
+              {"$ref": "#/$defs/text"},
+              {"minLength": 1, "maxLength": 512, "pattern": "^[^/\\\\:%]+(?:/[^/\\\\:%]+)*(?![\\s\\S])"},
+              {"not": {"pattern": "(?:^|/)\\.{1,2}(?:/|$)"}},
+              {"not": {"pattern": "(?:^|/)(?:\\.[eE][nN][vV]|\\.[gG][iI][tT]|[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]|[sS][eE][cC][rR][eE][tT][sS]|[iI][dD]_[rR][sS][aA]|[iI][dD]_[eE][dD]25519)"}},
+              {"not": {"pattern": "(?:^|/)(?:\\.[sS][sS][hH]|\\.[aA][wW][sS]|\\.[aA][zZ][uU][rR][eE]|\\.[nN][pP][mM][rR][cC]|\\.[nN][eE][tT][rR][cC]|\\.[pP][yY][pP][iI][rR][cC])(?:/|$)"}},
+              {"not": {"pattern": "\\.(?:[pP][eE][mM]|[kK][eE][yY]|[pP]12|[pP][fF][xX])(?:/|$)"}}
+            ]
+          },
+          "method": {"allOf": [{"$ref": "#/$defs/text"}, {"minLength": 1, "maxLength": 128}]}
+        }
+      }
+    },
+    "extractionMethod": {"enum": ["explicit-declaration", "package-boundary", "static-interface"]},
+    "unresolvedQuestions": {"type": "array", "maxItems": 32, "items": {"allOf": [{"$ref": "#/$defs/text"}, {"minLength": 1}]}}
+  },
+  "$defs": {
+    "name": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(?![\\s\\S])"},
+    "text": {"type": "string", "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u0600-\\u0605\\u061c\\u06dd\\u070f\\u0890-\\u0891\\u08e2\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u206f\\ud800-\\udfff\\ufeff\\ufff9-\\ufffb]*(?![\\s\\S])"},
+    "integer": {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991},
+    "ports": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["name", "type"],
+        "properties": {"name": {"$ref": "#/$defs/name"}, "type": {"enum": ["string", "number", "integer", "boolean"]}}
+      }
+    },
+    "values": {
+      "type": "object", "maxProperties": 32, "propertyNames": {"$ref": "#/$defs/name"},
+      "additionalProperties": {"anyOf": [{"$ref": "#/$defs/text"}, {"$ref": "#/$defs/integer"}, {"type": "boolean"}]}
+    }
+  },
+  "$comment": "Backend semantics are authoritative: all numbers use JSON integer syntax, never booleans as integers; reject every Unicode Cc/Cf/Cs/Zl/Zp character, including supplementary invisible characters. All object keys and port names are ASCII identifiers. Dependency names are opaque package names (including @scope/name), not filesystem paths; version ranges are retained but unresolved. Evidence references are metadata only and must be normalized relative nonsensitive paths; no referenced file is read. Names are unique within port, connection, test, and dependency lists; test names/connections/values match declared signatures. Preserve v1 bounds: <=65536 canonical UTF-8 bytes, <=12 nesting levels, <=4096 total values including keys, <=4096 code points per string, <=64 items per array, <=32 properties per object. maxArrayLength applies only to module/connection port lists, engineConnections and syntheticTests, not constraints or v2 metadata. Backend availability is configuration, never client claims. Completion requires explicit declaration, no unresolved questions/constraints/interfaces/dependencies, nonempty feasible placements, and backend-executed passing synthetic tests. Complete is local synthetic assessment, never live admission."
+}

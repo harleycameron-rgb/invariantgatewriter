@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local ZIP declaration review</title>
+<style>
+body{font:16px system-ui;max-width:72rem;margin:2rem auto;padding:1rem}textarea{box-sizing:border-box;width:100%;height:22rem}pre{white-space:pre-wrap;overflow-wrap:anywhere}section{border:1px solid #888;padding:1rem;margin:1rem 0}button{margin:.5rem}svg{width:24rem;max-width:100%;height:18rem;border:1px solid #888}label{display:block}
+</style>
+<h1>Browser-local ZIP inspection</h1>
+<p>ZIPs and repository source never leave this browser. No repository code executes. Only individually reviewed declarations can be sent for synthetic tests. Privacy scanning is fallible: inspect every outgoing field, including evidence paths. Synthetic success is not live acceptance.</p>
+<p>Limits: 8 MiB ZIP, 16 MiB expanded, 256 entries, 1 MiB per file, 100:1 expansion. Nested archives and private paths are excluded without extraction.</p>
+<label>Choose ZIP <input id="archive" type="file" accept=".zip,application/zip"></label>
+<button id="reset" type="button">Close / reset</button>
+<p id="summary" role="status"></p>
+<div id="candidates"></div>
+<h2>Live host</h2>
+<p>Live not connected. This public service has no live gate endpoint. No signing or qualification service is simulated.</p>
+<pre id="live"></pre>
+<script type="module">
+import {inspectZip, validateReviewedManifest, declarationHash, renderConfirmedReceipt} from "/zip_intake.mjs";
+const file = document.querySelector("#archive"), summary = document.querySelector("#summary"), list = document.querySelector("#candidates");
+let generation = 0, controller = null;
+function reset() {
+  generation++; controller?.abort(); controller = null;
+  file.value = ""; list.replaceChildren(); summary.textContent = ""; document.querySelector("#live").textContent = "";
+}
+document.querySelector("#reset").onclick = reset;
+window.addEventListener("pagehide", reset);
+const node = (tag, text) => { const n = document.createElement(tag); n.textContent = text; return n; };
+function projection(topology, target) {
+  if (!topology || !["a", "b"].every(k => Number.isFinite(topology[k]) && topology[k] > 0)) return;
+  const ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 300 220"); svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Backend-provided sparse parabola sandbox projection; not capacity");
+  for (const coefficient of [topology.a, topology.b]) {
+    const path = document.createElementNS(ns, "polyline");
+    const points = [];
+    for (let i = 0; i <= 24; i++) { const x = -1 + i / 12, y = coefficient * x * x; if (y <= 1) points.push(`${150 + x * 125},${200 - y * 175}`); }
+    path.setAttribute("points", points.join(" ")); path.setAttribute("fill", "none"); path.setAttribute("stroke", coefficient === topology.a ? "#246" : "#964"); svg.append(path);
+  }
+  const p = topology.completionPoint;
+  const x = Array.isArray(p) ? p[0] : p?.x, y = Array.isArray(p) ? p[1] : p?.y;
+  if (Number.isFinite(x) && Number.isFinite(y) && Math.abs(x) <= 1 && y <= 1 && y >= Math.max(topology.a * x * x, topology.b * x * x)) {
+    const point = document.createElementNS(ns, "circle");
+    point.setAttribute("cx", 150 + x * 125); point.setAttribute("cy", 200 - y * 175); point.setAttribute("r", "4"); point.setAttribute("fill", "#164"); svg.append(point);
+  }
+  target.append(svg);
+}
+function candidate(manifest, epoch) {
+  const section = document.createElement("section");
+  section.append(node("h2", `${manifest.moduleId} — ${manifest.extractionMethod === "explicit-declaration" ? "explicit" : "inferred"}`));
+  const label = node("label", "Outgoing declaration (edit before review)");
+  const area = document.createElement("textarea"); area.spellcheck = false; area.value = JSON.stringify(manifest, null, 2); label.append(area);
+  const review = document.createElement("input"); review.type = "checkbox";
+  const approval = node("label", " I reviewed every field and explicitly opt in to sending this declaration only."); approval.prepend(review);
+  const send = node("button", "Send reviewed declaration for synthetic tests"); send.type = "button"; send.disabled = true;
+  const result = document.createElement("pre"), plot = document.createElement("div");
+  review.onchange = () => { send.disabled = !review.checked; };
+  area.oninput = () => { review.checked = false; send.disabled = true; result.textContent = ""; plot.replaceChildren(); };
+  send.onclick = async () => {
+    if (!review.checked || epoch !== generation) return;
+    send.disabled = true;
+    let outgoing = null;
+    try {
+      outgoing = validateReviewedManifest(JSON.parse(area.value));
+      const hash = await declarationHash(outgoing);
+      if (epoch !== generation || !review.checked) return;
+      const body = JSON.stringify(outgoing);
+      controller = new AbortController();
+      const response = await fetch("/api/test", {method: "POST", credentials: "omit", headers: {"Content-Type": "application/json"}, body, signal: controller.signal});
+      const data = await response.json();
+      if (epoch !== generation) return;
+      const identity = data.identityRing, placement = data.placementRing;
+      const matched = identity?.moduleId === outgoing.moduleId && identity.declarationSha512 === hash;
+      result.textContent = JSON.stringify({
+        H: {[outgoing.moduleId]: hash},
+        P: {[outgoing.moduleId]: placement?.proposed ?? outgoing.proposedPlacements},
+        feasible: placement?.feasible ?? [],
+        status: !response.ok ? "rejection" : matched ? (data.status ?? "pending") : "pending: backend identity not confirmed",
+        syntheticOnly: true, results: data.syntheticResults ?? data.tests ?? data.results ?? [],
+        evidence: data.evidence ?? outgoing.evidence,
+        unresolvedConditions: data.unresolvedConditions ?? outgoing.unresolvedQuestions
+      }, null, 2);
+      plot.replaceChildren(); if (matched) projection(data.topology, plot);
+    } catch { if (epoch === generation) result.textContent = "Local validation or synthetic request rejected. No live acceptance."; }
+    finally { outgoing = null; if (epoch === generation) send.disabled = !review.checked; controller = null; }
+  };
+  section.append(label, approval, send, result, plot); list.append(section);
+}
+file.onchange = async () => {
+  generation++; controller?.abort(); list.replaceChildren(); const epoch = generation;
+  let selected = file.files?.[0], inspection = null;
+  file.value = "";
+  if (!selected) return;
+  summary.textContent = "Inspecting locally…";
+  try {
+    inspection = await inspectZip(selected);
+    if (epoch !== generation) return;
+    summary.textContent = `${inspection.candidates.length} candidates. Exclusions (counts only): ${JSON.stringify(inspection.exclusions)}. Review is required.`;
+    for (const manifest of inspection.candidates) candidate(manifest, epoch);
+  } catch { if (epoch === generation) summary.textContent = "ZIP rejected by local safety checks. Nothing uploaded."; }
+  finally { selected = null; if (inspection) inspection.candidates.length = 0; inspection = null; }
+};
+// Host integration only: the trusted host owns verification; never call from public test results.
+export function hostReceiptFromTrustedAdapter(response) {
+  renderConfirmedReceipt(response, document.querySelector("#live"));
+}
+export async function hostGatePreview(bridge, reviewedDeclaration) {
+  if (typeof bridge?.droppoint_gate_dry_run !== "function") throw new Error("Live host not connected");
+  return bridge.droppoint_gate_dry_run(validateReviewedManifest(reviewedDeclaration));
+}
+</script>
+</html>

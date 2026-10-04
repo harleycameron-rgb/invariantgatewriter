@@ -9,6 +9,20 @@ It validates declarations and runs predefined synthetic operations, not uploaded
 code. A passing public test establishes only the properties actually tested:
 **live admission still requires the gate's qualification policy**.
 
+### Contents
+
+- [Connection status](#connection-status)
+- [Gate model and tools](#gate-model)
+- [Qualification contract](#qualification-contract)
+- [Privacy and credentials](#privacy-and-credentials)
+- [Setup and local tests](#setup-and-local-tests)
+- [Existing host connection](#existing-host-connection)
+- [Qualification-service connection](#qualification-service-connection)
+- [Public module test node](#public-module-test-node)
+- [Local ZIP inspection and module extraction](#local-zip-inspection-and-module-extraction)
+- [Identity, placement and convergence](#identity-placement-and-convergence)
+- [Multiple qualification events](#multiple-qualification-events)
+
 ## Connection status
 
 This repository did not contain the existing InvariantTap MCP host or a trusted
@@ -90,6 +104,10 @@ and invalid timestamp ranges are rejected too.
 
 **No raw media retained; receipt metadata retained.**
 
+“ZIP inspection happens locally. Reviewed module declarations may be sent for
+qualification. No raw media or repository files are retained by the gate;
+receipt metadata is retained.”
+
 Do not send raw audio, video, images, filenames, dates of birth or personal
 details. Event identifiers must be opaque: the writer cannot determine whether
 an arbitrary identifier embeds personal information.
@@ -107,6 +125,19 @@ are required. Run the regression suite from the repository root:
 cd /home/runner/work/invariantgatewriter/invariantgatewriter
 python -m unittest discover -s tests -v
 ```
+
+For browser-local ZIP logic, use Node.js 22 or newer and its built-in test runner:
+
+```sh
+node --test tests/test_zip_intake.mjs
+```
+
+No uploaded repository code is run by either test node. Regression tests cover
+authentication, forged/expired qualifications, isolated test stores, concurrent
+deduplication, full stacks, partial batches and persistence; public-node tests
+cover schema/compatibility, limits and API/MCP transport; ZIP/model tests cover
+unsafe archives, multiple candidates, fingerprint determinism, feasible-set
+narrowing and upward-opening focus geometry.
 
 For deployment, choose a persistent SQLite database path writable only by the
 backend service account. Protect the database and its backups as receipt
@@ -222,8 +253,10 @@ The built-in interface catalog supports `identity/1` (string identity),
 `numbers.add/1`, `text.concat/1` and `boolean.not/1`. Tests use only these
 predefined implementations. They check declared **connection** signatures and
 synthetic expected outputs, not the behavior of an uploaded module
-implementation. Structural constraints apply only to synthetic values; they
-cannot establish universal guarantees for real-world inputs.
+implementation. String/numeric constraints apply only to synthetic values;
+`maxArrayLength` checks declaration port, connection and test lists, not runtime
+array behavior. These checks cannot establish universal guarantees for real-world
+inputs.
 
 | Interface | Inputs | Outputs |
 | --- | --- | --- |
@@ -233,7 +266,8 @@ cannot establish universal guarantees for real-world inputs.
 | `boolean.not/1` | `value: boolean` | `value: boolean` |
 
 Supported constraint kinds are `maxStringLength`, `maxArrayLength` and
-`nonNegativeNumbers`. Unrecognized or non-applicable constraints remain
+`nonNegativeNumbers`; version 2 also supports placement constraints
+`includeEngine` and `excludeEngine`. Unrecognized or non-applicable constraints remain
 unresolved. A receipt is a caller-returned, unsigned report of local checks,
 not a trusted qualification signature.
 
@@ -251,6 +285,8 @@ trust arbitrary forwarded client-IP headers; only configure a trusted proxy
 integration after verifying its behavior. Disable body logging, analytics and
 request capture at the proxy as well as the application to preserve transient
 processing.
+The original InvariantTap host is unavailable here: its logging and retention
+have not been inspected. No broader host-wide zero-retention guarantee is made.
 
 Start the local browser/API service from the repository root:
 
@@ -282,3 +318,137 @@ authorization context.
 Requests are limited to 64 KiB. Default limits are 60 requests per client per
 minute and 300 globally per minute. Client identification uses the peer address,
 not untrusted `X-Forwarded-For`. Clients behind one proxy may share a quota.
+
+The HTTP server caps active connections at 32 and uses five-second socket
+timeouts. Configure `--allowed-host` and `--allowed-origin` (repeatable) for a
+reverse-proxied deployment, including any nondefault port in the host authority.
+Use `--max-connections` to change the connection cap. Defaults permit local
+addresses; the allowlist is not inferred from arbitrary incoming headers.
+
+## Local ZIP inspection and module extraction
+
+Open `/zip` on the local public-node server. The browser reads the ZIP locally;
+it sends neither the archive nor extracted repository files to the backend.
+Repository code is never executed, and the original archive/files are unchanged.
+Clear/end inspection to discard working buffers and UI state.
+
+The archive inspector bounds archive bytes, streamed expansion and entry counts,
+and rejects unsafe paths, symlinks, unsupported encrypted/ZIP64/multidisk
+archives, duplicate/conflicting names, malformed metadata, bad checksums and
+oversized expansions. Nested archive entries are excluded; they are never
+recursively expanded.
+
+| Resource | Limit |
+| --- | --- |
+| ZIP archive | 8 MiB |
+| Total expanded files | 16 MiB |
+| Individual file | 1 MiB |
+| Archive entry count (including directories) | 256 |
+| Expansion ratio | 100:1 |
+
+Extraction prefers explicit module declarations; otherwise it identifies
+package boundaries using static metadata. It does not split every file into a
+module, invent missing contracts or inflate receipt counts. Inferred candidates
+carry unresolved questions; unknown contracts stay unknown. Evidence references
+and extraction methods distinguish declarations from inference.
+
+Use `droppoint.module.json` for explicit declarations (one manifest, or a
+`modules` list). Static package metadata provides inferred candidates when no
+explicit declaration covers that boundary. The small
+[`synthetic_modules.zip`](tests/fixtures/synthetic_modules.zip) fixture exercises
+multiple local candidates; its declarations and synthetic cases are test
+material, not live qualifications.
+
+Credentials, private keys, environment files and personal material are excluded
+from outgoing declarations where detected. **Detection is fallible.** Inspect
+and edit each outgoing declaration, then explicitly approve it before sending.
+Do not include secrets or personal information in descriptions, contracts or
+evidence paths. Only reviewed declaration JSON is sent to the public test API.
+
+Version `module-manifest/2` adds `dependencies`, `proposedPlacements`, `evidence`,
+`extractionMethod` and `unresolvedQuestions` to the original declaration.
+Version 1 remains supported for existing callers. The version 2 contract is
+[`module_manifest_v2.schema.json`](invariantgatewriter/module_manifest_v2.schema.json).
+Version 2 numeric values are safe JSON integers to keep browser and backend
+canonicalization identical. The fingerprint identifies the reviewed declaration
+snapshot; it neither proves behavior nor independently describes the constraint
+architecture.
+
+## Identity, placement and convergence
+
+Two separate reports prevent confusing declaration identity with compatibility:
+
+- **H:** module ID → canonical declaration SHA-512.
+- **P:** module ID → proposed engine placements and remaining feasible choices.
+
+Placement checks compare declared connection interfaces, backend-known
+dependency availability, and inclusion/exclusion constraints. Results record
+evidence, unresolved conditions and each narrowing of the feasible set **K**.
+A hash alone never establishes physical contact, orbital compatibility or
+technology compatibility. Built-in engine interfaces are local synthetic
+implementations, not verified remote deployments.
+
+### Versioned parabola mapping
+
+`parabola-sha512/1` reads the first and second two-byte big-endian unsigned
+integers from the declaration digest and divides each by 65535 to obtain
+`alpha` and `beta`. Thus both coefficients are in [0, 1]:
+
+- `P_A(x) = (1 + alpha) * x²`
+- `P_B(x) = (1 + beta) * x²`
+
+Both curves open **upward**, with vertex (0, 0). Writing `a = 1 + alpha` and
+`b = 1 + beta`, their foci are (0, 1/(4a)) and (0, 1/(4b)); directrices are
+`y = -1/(4a)` and `y = -1/(4b)`. These are abstract topology coordinates, not
+physical measurements.
+
+The sandbox is `-1 ≤ x ≤ 1` and `max(a*x², b*x²) ≤ y ≤ 1`.
+Its feasible horizontal range is `|x| ≤ sqrt(1/max(a,b))`.
+Equal coefficients produce coincident curves, not a unique convergence point.
+The UI draws only candidate curves, points and known receipts; it never allocates
+the gate's theoretical capacity.
+
+Empty K means **incompatible**. Remaining unresolved conditions mean **pending**.
+A completion point is reported only after compatible interfaces, resolved
+dependencies/constraints, an explicit reviewed declaration and successful
+nonempty synthetic tests satisfy the documented resolution conditions.
+The common vertex may then represent completion; plotting it by itself proves
+nothing. Partial resolution is a legitimate result, and even local completion
+does not authorize a live gate write.
+
+## Multiple qualification events
+
+Several candidates from one ZIP are assessed independently. A backend trusted
+qualification service must decide live admission per candidate; the browser and
+public node cannot issue live qualifications. No fixture or synthetic-test
+receipt is promoted to a live qualification.
+
+Use one stable opaque qualification event ID per module/event and reuse it for
+retries. A new chronological event needs a new ID; declaration identity is its
+fingerprint, not its event ID. Retry deduplication and event-content conflicts
+remain enforced by the existing transactional gate writer.
+The qualifier must return the same qualification body for an event retry,
+including its timestamps; changing the body under an existing event ID is a
+conflict. Expired qualifications remain invalid, even for duplicates. A genuinely
+new qualification event uses a new event ID rather than silently rewriting one.
+
+For a connected backend, import `submit_reviewed_modules` from
+`invariantgatewriter.qualification`. Supply 1–100 items containing `declaration`
+and `qualificationId`, plus the writer, backend-only qualifier, authorization
+callback and trusted caller context. The callback must authenticate and grant
+`gate:write`. The qualifier returns a signed qualification or a pending/rejected
+decision; the helper binds its event ID and module hash to the reviewed snapshot
+before invoking the gate writer. Missing qualifiers return pending, not invented
+acceptance. Each item returns success with a placement, pending, or rejection;
+successful items remain committed if others fail.
+
+This helper is not exposed by the public API/MCP process. Integrating it into the
+real host requires the host's authenticated transport and the actual trusted
+qualification-service interface. Its credentials, policy decisions and signing
+remain backend-only.
+
+The local UI can display per-module synthetic success, pending and rejection,
+identity/placement rings, constraint evidence and the parabola projection.
+Receipt coordinates and stack layers are shown only after an actual successful
+write through a connected authenticated host bridge. Neither the trusted
+qualifier nor that live browser-to-host bridge is connected in this repository.
