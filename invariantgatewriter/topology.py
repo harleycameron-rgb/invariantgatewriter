@@ -1,21 +1,17 @@
 """Declaration identity and local placement assessment, never live admission."""
 
 import hashlib
-import math
-import re
 import unicodedata
 
 
-MAPPING_VERSION = "parabola-sha512/1"
 SAFE_INTEGER = 2**53 - 1
 V2_FIELDS = (
     "schema", "moduleId", "version", "purpose", "inputs", "outputs", "constraints",
     "engineConnections", "syntheticTests", "dependencies", "proposedPlacements",
-    "evidence", "extractionMethod", "unresolvedQuestions",
+    "evidence", "extractionMethod", "unresolvedQuestions", "businessRequirements",
 )
 EXTRA_FIELDS = V2_FIELDS[9:]
 EXTRACTION_METHODS = ("explicit-declaration", "package-boundary", "static-interface")
-DIGEST = re.compile(r"[0-9a-f]{128}\Z", re.ASCII)
 
 
 def _exact_dependency_version(version):
@@ -77,7 +73,9 @@ def validate_declaration(manifest):
     from .public_node import _bounded, _object, _require, _string, _array, _validate_v1, NAME, _is_name
 
     canonical = _bounded(manifest)
-    _object(manifest, V2_FIELDS)
+    _require(type(manifest) is dict
+             and set(manifest) in (set(V2_FIELDS) - {"businessRequirements"}, set(V2_FIELDS)),
+             "Invalid object fields.")
     _require(manifest["schema"] == "module-manifest/2", "Unsupported manifest schema.")
 
     def walk(value):
@@ -98,6 +96,25 @@ def validate_declaration(manifest):
     base = {key: value for key, value in manifest.items() if key not in EXTRA_FIELDS}
     base["schema"] = "module-manifest/1"
     _validate_v1(base)
+    requirements = manifest.get("businessRequirements", {
+        "function": manifest["purpose"], "inputs": manifest["inputs"],
+        "outputs": manifest["outputs"],
+        "acceptanceCases": [test["name"] for test in manifest["syntheticTests"]],
+    })
+    _object(requirements, ("function", "inputs", "outputs", "acceptanceCases"))
+    _string(requirements["function"], maximum=4096)
+    _require(bool(requirements["function"].strip()), "Business function is required.")
+    _require(requirements["inputs"] == manifest["inputs"]
+             and requirements["outputs"] == manifest["outputs"],
+             "Business requirement ports must match the declared module ports.")
+    _array(requirements["acceptanceCases"], 64)
+    cases = []
+    for case in requirements["acceptanceCases"]:
+        _string(case, pattern=NAME)
+        _require(case not in cases, "Duplicate business acceptance case.")
+        cases.append(case)
+    _require(cases == [test["name"] for test in manifest["syntheticTests"]],
+             "Business acceptance cases must match the declared synthetic tests.")
     _array(manifest["dependencies"], 32)
     names = set()
     for dependency in manifest["dependencies"]:
@@ -130,30 +147,6 @@ def validate_declaration(manifest):
     return hashlib.sha512(canonical).hexdigest()
 
 
-def declaration_topology(digest, *, complete=False):
-    """Map the first two digest byte pairs to upward-opening abstract curves."""
-    from .public_node import _require
-    _require(type(digest) is str and DIGEST.fullmatch(digest) is not None,
-             "Invalid declaration digest.")
-    raw = bytes.fromhex(digest)
-    alpha = int.from_bytes(raw[:2], "big") / 65535
-    beta = int.from_bytes(raw[2:4], "big") / 65535
-    a, b = 1 + alpha, 1 + beta
-    bound = math.sqrt(1 / max(a, b))
-    return {
-        "mappingVersion": MAPPING_VERSION, "alpha": alpha, "beta": beta, "a": a, "b": b,
-        "orientation": "upward", "vertex": [0, 0],
-        "focusA": [0, 1 / (4 * a)], "focusB": [0, 1 / (4 * b)],
-        "directrixA": -1 / (4 * a), "directrixB": -1 / (4 * b),
-        "curves": {"A": "y=a*x^2", "B": "y=b*x^2"},
-        "intersection": "coincident" if a == b else "common-vertex",
-        "sandbox": {"domainXMin": -1, "domainXMax": 1, "xMin": -bound,
-                    "xMax": bound, "yMax": 1, "yMin": "max(a*x^2,b*x^2)"},
-        "completionPoint": [0, 0] if complete else None,
-        "interpretation": "Abstract topology only; hashes and intersections do not prove compatibility.",
-    }
-
-
 def builtin_engine_catalog():
     """Local predefined test implementations, not remote deployment connections."""
     from .public_node import INTERFACES
@@ -168,7 +161,7 @@ def builtin_engine_catalog():
 
 def assess_declaration(manifest, digest, *, test_receipt=None,
                        available_dependencies=None, engine_catalog=None):
-    """Narrow finite engine choices alongside the continuous abstract sandbox.
+    """Narrow the finite candidate set using trusted tests and configuration.
 
     Configuration and test_receipt are trusted backend inputs, never client
     availability claims. A receipt must come from this node's executed tests.
@@ -198,8 +191,8 @@ def assess_declaration(manifest, digest, *, test_receipt=None,
     if not proposed:
         check("placements", "No engine placements were explicitly proposed.", pending=True)
     check("identity", "SHA-512 identifies the declaration, not compatibility.",
-          details={"declarationSha512": digest, "mappingVersion": MAPPING_VERSION})
-    check("extraction", "An explicit declaration is required for completion.",
+          details={"moduleId": manifest["moduleId"], "declarationSha512": digest})
+    check("extraction", "An explicit declaration is required for a complete assessment.",
           pending=manifest["extractionMethod"] != "explicit-declaration",
           details={"method": manifest["extractionMethod"]})
     for question in manifest["unresolvedQuestions"]:
@@ -264,8 +257,9 @@ def assess_declaration(manifest, digest, *, test_receipt=None,
     receipt = test_receipt if type(test_receipt) is dict else {}
     tests = receipt.get("tests", [])
     scope = receipt.get("scope", {})
-    matching = (receipt.get("schema") == "module-synthetic-receipt/1"
+    matching = (receipt.get("schema") == "module-synthetic-receipt/2"
                 and receipt.get("declarationSha512") == digest and receipt.get("synthetic") is True
+                and receipt.get("signed") is False
                 and receipt.get("liveAdmission") is False
                 and type(scope) is dict
                 and scope.get("execution") == "backend-defined builtin connection interfaces only")
@@ -282,6 +276,29 @@ def assess_declaration(manifest, digest, *, test_receipt=None,
                 for name, actual in test["actualOutputs"].items()) for test in tests)
     failed = executed and (receipt.get("status") == "failed" or any(
         type(test) is dict and test.get("status") == "failed" for test in tests))
+    if executed:
+        connection_by_name = {connection["name"]: connection
+                              for connection in manifest["engineConnections"]}
+        results_by_name = {test["name"]: test for test in tests if type(test) is dict}
+        for case in manifest["syntheticTests"]:
+            result = results_by_name[case["name"]]
+            if result.get("status") not in ("passed", "failed"):
+                continue
+            connection = connection_by_name[case["connection"]]
+            interface = connection["interface"]
+            signature = (_ports(connection["inputs"]), _ports(connection["outputs"]))
+            supported = {engine for engine, interfaces in catalog.items()
+                         if interfaces.get(interface) == signature}
+            check("acceptance-case",
+                  "Passing acceptance evidence narrows compatible local candidates."
+                  if result["status"] == "passed" else
+                  "Failed acceptance evidence excludes candidates for this interface.",
+                  keep=supported if result["status"] == "passed" else set(),
+                  details={"case": case["name"], "connection": case["connection"],
+                           "moduleId": manifest["moduleId"], "interface": interface,
+                           "status": result["status"], "expectedOutputs": case["expectedOutputs"],
+                           "actualOutputs": result.get("actualOutputs"),
+                           "candidatePlacements": sorted(supported)})
     check("synthetic-tests", "Executed backend synthetic tests passed." if passed else
           "Executed backend synthetic tests failed." if failed else
           "Passing executed backend synthetic tests are still required.",
@@ -293,7 +310,6 @@ def assess_declaration(manifest, digest, *, test_receipt=None,
         "identityRing": {"moduleId": manifest["moduleId"], "declarationSha512": digest},
         "placementRing": {"moduleId": manifest["moduleId"], "proposed": proposed,
                           "feasible": sorted(feasible)},
-        "topology": declaration_topology(digest, complete=status == "complete"),
         "status": status, "evidence": evidence, "unresolvedConditions": unresolved,
-        "liveAdmission": False, "completionScope": "local synthetic declaration assessment only",
+        "liveAdmission": False, "assessmentScope": "local synthetic declaration assessment only",
     }

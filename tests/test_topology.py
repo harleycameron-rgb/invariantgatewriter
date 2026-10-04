@@ -1,14 +1,12 @@
 import copy
 import hashlib
 import json
-import math
 import unittest
 from pathlib import Path
 
 from invariantgatewriter.public_node import PublicModuleNode, PublicNodeError
 from invariantgatewriter.topology import (
-    MAPPING_VERSION, SAFE_INTEGER, assess_declaration,
-    builtin_engine_catalog, declaration_topology, validate_declaration,
+    SAFE_INTEGER, assess_declaration, builtin_engine_catalog, validate_declaration,
 )
 
 
@@ -27,6 +25,10 @@ def manifest():
         "dependencies": [], "proposedPlacements": ["numbers", "local-sandbox"],
         "evidence": [{"reference": "module.json", "method": "explicit-declaration"}],
         "extractionMethod": "explicit-declaration", "unresolvedQuestions": [],
+        "businessRequirements": {
+            "function": "Add two numbers.", "inputs": copy.deepcopy(inputs),
+            "outputs": copy.deepcopy(outputs), "acceptanceCases": ["basic"],
+        },
     }
 
 
@@ -35,6 +37,8 @@ def receipt(value):
 
 
 def assess(value, tested=False, **kwargs):
+    value["businessRequirements"]["acceptanceCases"] = [
+        test["name"] for test in value["syntheticTests"]]
     return assess_declaration(value, validate_declaration(value),
                               test_receipt=receipt(value) if tested else None, **kwargs)
 
@@ -56,38 +60,7 @@ class TopologyTests(unittest.TestCase):
                                   if field == "dependencies" else ["question"])
             self.assertNotEqual(validate_declaration(changed), digest)
 
-    def test_model_extremes_and_digest_byte_order(self):
-        for first, second in [(0, 0), (65535, 65535), (0, 65535), (65535, 0), (258, 772)]:
-            digest = first.to_bytes(2, "big").hex() + second.to_bytes(2, "big").hex() + "00" * 60
-            result = declaration_topology(digest)
-            self.assertEqual(result["mappingVersion"], MAPPING_VERSION)
-            self.assertEqual(result["alpha"], first / 65535)
-            self.assertEqual(result["beta"], second / 65535)
-            self.assertEqual(result["vertex"], [0, 0])
-            self.assertEqual(result["orientation"], "upward")
-            for suffix in ("A", "B"):
-                coefficient = result["a" if suffix == "A" else "b"]
-                focus = result["focus" + suffix]
-                self.assertEqual(focus, [0, 1 / (4 * coefficient)])
-                self.assertEqual(result["directrix" + suffix], -focus[1])
-            bound = result["sandbox"]["xMax"]
-            self.assertEqual(result["sandbox"]["xMin"], -bound)
-            self.assertAlmostEqual(max(result["a"], result["b"]) * bound**2, 1)
-            self.assertEqual(result["intersection"], "coincident" if first == second else "common-vertex")
-            self.assertIsNone(result["completionPoint"])
-            self.assertEqual(declaration_topology(digest, complete=True)["completionPoint"], [0, 0])
-
-    def test_fingerprint_stability(self):
-        result = declaration_topology("01234567" + "ab" * 60)
-        self.assertEqual(result["alpha"], 291 / 65535)
-        self.assertEqual(result["beta"], 17767 / 65535)
-        self.assertEqual(result, declaration_topology("01234567" + "ab" * 60))
-        self.assertAlmostEqual(result["sandbox"]["xMax"], math.sqrt(1 / result["b"]))
-
     def test_invalid_digest_sanitized(self):
-        for digest in ("bad", "A" * 128, "", None):
-            with self.assertRaisesRegex(PublicNodeError, "Invalid declaration digest"):
-                declaration_topology(digest)
         with self.assertRaisesRegex(PublicNodeError, "Declaration digest mismatch"):
             assess_declaration(manifest(), "0" * 128)
 
@@ -98,14 +71,13 @@ class TopologyTests(unittest.TestCase):
         self.assertEqual(result["identityRing"]["declarationSha512"], validate_declaration(value))
         self.assertEqual(result["placementRing"]["proposed"], value["proposedPlacements"])
         self.assertEqual(result["status"], "pending")
-        self.assertIsNone(result["topology"]["completionPoint"])
+        self.assertNotIn("topology", result)
         self.assertFalse(result["liveAdmission"])
-        self.assertIn("local synthetic", result["completionScope"])
+        self.assertIn("local synthetic", result["assessmentScope"])
 
     def test_completion_needs_backend_tests_and_explicit_declaration(self):
         value = manifest()
         self.assertEqual(assess(value, tested=True)["status"], "complete")
-        self.assertEqual(assess(value, tested=True)["topology"]["completionPoint"], [0, 0])
         for method in ("package-boundary", "static-interface"):
             value["extractionMethod"] = method
             self.assertEqual(assess(value, tested=True)["status"], "pending")
@@ -145,6 +117,17 @@ class TopologyTests(unittest.TestCase):
             self.assertLessEqual(set(item["after"]), set(item["before"]))
             self.assertIn("reason", item)
             self.assertIn("evidence", item)
+
+    def test_acceptance_evidence_narrows_optional_candidate_set(self):
+        value = manifest()
+        value["engineConnections"][0]["required"] = False
+        value["proposedPlacements"] = ["numbers", "text", "local-sandbox"]
+        result = assess(value, tested=True)
+        self.assertEqual(result["placementRing"]["feasible"], ["local-sandbox", "numbers"])
+        evidence = next(item for item in result["evidence"] if item["kind"] == "acceptance-case")
+        self.assertEqual(evidence["evidence"]["case"], "basic")
+        self.assertEqual(evidence["before"], ["local-sandbox", "numbers", "text"])
+        self.assertEqual(evidence["after"], ["local-sandbox", "numbers"])
 
     def test_unknown_placements_empty_proposals_and_unknown_interfaces(self):
         value = manifest()
@@ -318,7 +301,8 @@ class V2ValidationTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "invariantgatewriter/module_manifest_v2.schema.json"
         schema = json.loads(path.read_text())
         self.assertEqual(schema["properties"]["schema"]["const"], "module-manifest/2")
-        self.assertEqual(set(schema["required"]), set(manifest()))
+        self.assertEqual(set(schema["required"]), set(manifest()) - {"businessRequirements"})
+        self.assertIn("businessRequirements", schema["properties"])
         self.assertEqual(schema["$defs"]["integer"]["maximum"], SAFE_INTEGER)
 
 

@@ -39,7 +39,11 @@ def manifest_v2():
     value.update(schema="module-manifest/2", dependencies=[],
                  proposedPlacements=["numbers", "local-sandbox"],
                  evidence=[{"reference": "module.json", "method": "explicit-declaration"}],
-                 extractionMethod="explicit-declaration", unresolvedQuestions=[])
+                 extractionMethod="explicit-declaration", unresolvedQuestions=[],
+                 businessRequirements={"function": "Add two numbers.",
+                                      "inputs": copy.deepcopy(value["inputs"]),
+                                      "outputs": copy.deepcopy(value["outputs"]),
+                                      "acceptanceCases": ["basic"]})
     return value
 
 
@@ -75,9 +79,72 @@ class V2ModuleTests(unittest.TestCase):
             self.assertFalse(result["liveAdmission"])
             self.assertEqual(result["status"], "complete" if action == "test" else "pending")
             self.assertEqual(result["syntheticReceipt"]["status"], "passed" if action == "test" else "not_run")
-            self.assertEqual(result["topology"]["completionPoint"], [0, 0] if action == "test" else None)
+            self.assertNotIn("topology", result)
             self.assertFalse(result["syntheticReceipt"]["scope"]["moduleImplementationExecuted"])
             self.assertFalse(result["syntheticReceipt"]["scope"]["placementAssessmentIncluded"])
+
+    def test_synthetic_receipt_binds_requirements_evidence_topology_and_event(self):
+        value = manifest_v2()
+        node = PublicModuleNode()
+        first = node.droppoint_module_test(value, "business-event-1")["syntheticReceipt"]
+        self.assertEqual(first["schema"], "module-synthetic-receipt/2")
+        self.assertTrue(first["synthetic"])
+        self.assertFalse(first["signed"])
+        self.assertFalse(first["liveAdmission"])
+        self.assertEqual(first["moduleId"], value["moduleId"])
+        self.assertEqual(first["requirements"], value["businessRequirements"])
+        self.assertEqual(first["requirements"]["inputs"], value["inputs"])
+        self.assertEqual(first["requirements"]["outputs"], value["outputs"])
+        self.assertEqual(first["evidence"], value["evidence"])
+        self.assertEqual(first["resolvedTopology"]["placementRing"]["feasible"], ["local-sandbox", "numbers"])
+        self.assertNotIn("topology", first["resolvedTopology"])
+        body = {key: child for key, child in first.items()
+                if key not in ("receiptSha512", "duplicate")}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, allow_nan=False).encode()
+        self.assertEqual(first["receiptSha512"], hashlib.sha512(canonical).hexdigest())
+        self.assertNotIn("signature", first)
+
+    def test_synthetic_event_retries_deduplicate_and_reject_changed_content(self):
+        value = manifest_v2()
+        node = PublicModuleNode()
+        first = node.droppoint_module_test(value, "business-event-2")["syntheticReceipt"]
+        retry = node.droppoint_module_test(value, "business-event-2")["syntheticReceipt"]
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(retry["duplicate"])
+        self.assertEqual(retry["receiptSha512"], first["receiptSha512"])
+        changed = copy.deepcopy(value)
+        changed["purpose"] += " changed"
+        rejected = node.droppoint_module_test(changed, "business-event-2")
+        self.assertFalse(rejected["valid"])
+        self.assertEqual(rejected["errorCode"], "event_id_conflict")
+        self.assertFalse(rejected["liveAdmission"])
+
+    def test_business_requirements_are_declared_and_bound_to_acceptance_cases(self):
+        value = manifest_v2()
+        value["businessRequirements"]["acceptanceCases"] = ["other"]
+        result = PublicModuleNode().droppoint_module_validate(value)
+        self.assertFalse(result["valid"])
+        self.assertNotIn("declarationSha512", result)
+        value = manifest_v2()
+        value["businessRequirements"]["function"] = " "
+        self.assertFalse(PublicModuleNode().droppoint_module_validate(value)["valid"])
+        value = manifest_v2()
+        value["businessRequirements"]["inputs"][0]["type"] = "integer"
+        self.assertFalse(PublicModuleNode().droppoint_module_validate(value)["valid"])
+        legacy = manifest_v2()
+        legacy.pop("businessRequirements")
+        result = PublicModuleNode().droppoint_module_test(legacy)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["syntheticReceipt"]["requirements"]["function"], legacy["purpose"])
+        self.assertEqual(result["syntheticReceipt"]["requirements"]["acceptanceCases"], ["basic"])
+
+    def test_public_form_example_is_a_valid_business_declaration(self):
+        page = Path("invariantgatewriter/public_node.html").read_text("utf-8")
+        example = re.search(r'<textarea id="manifest"[^>]*>(.*?)</textarea>', page, re.DOTALL)[1]
+        result = PublicModuleNode().droppoint_module_test(json.loads(example))
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["syntheticReceipt"]["status"], "passed")
 
     def test_backend_dependencies_and_catalog_are_not_client_claims(self):
         value = manifest_v2()
@@ -464,6 +531,20 @@ class ModuleTests(unittest.TestCase):
                 allowed_origins=["https://public.example"], max_connections=16)
             factory.return_value.server_close.assert_called_once()
 
+    def test_cli_reads_platform_environment_settings(self):
+        with patch("sys.argv", ["public_node"]), patch.dict("os.environ", {
+            "PUBLIC_HOST": "0.0.0.0", "PORT": "9090",
+            "PUBLIC_ALLOWED_HOSTS": "service.example:9090,localhost:9090",
+            "PUBLIC_ALLOWED_ORIGINS": "https://service.example",
+        }, clear=True), patch("invariantgatewriter.public_node.create_server") as factory:
+            factory.return_value.serve_forever.side_effect = KeyboardInterrupt
+            main()
+            factory.assert_called_once_with(
+                "0.0.0.0", 9090,
+                allowed_hosts=["service.example:9090", "localhost:9090"],
+                allowed_origins=["https://service.example"], max_connections=32)
+            factory.return_value.server_close.assert_called_once()
+
 
 class HTTPTests(unittest.TestCase):
     def setUp(self):
@@ -509,7 +590,8 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(result["valid"])
             self.assertFalse(result["liveAdmission"])
-        self.assertEqual(set(self.node.__dict__), {"limiter", "client_identity"})
+        self.assertEqual(set(self.node.__dict__),
+                         {"limiter", "client_identity", "_event_records", "_event_lock"})
         self.assertEqual(set(self.node.limiter.clients), {"127.0.0.1"})
 
     def test_mcp_flow(self):
@@ -530,6 +612,11 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(result["content"][0]["text"]), result["structuredContent"])
         self.assertFalse(result["isError"])
         self.assertEqual(result["structuredContent"]["syntheticReceipt"]["status"], "passed")
+        self.assertIn("eventId", next(tool for tool in tools if tool["name"] == "droppoint_module_test")["inputSchema"]["properties"])
+        event_reply = self.rpc("tools/call", {
+            "name": "droppoint_module_test",
+            "arguments": {"manifest": manifest(), "eventId": "mcp-event-1"}})[2]["result"]["structuredContent"]
+        self.assertEqual(event_reply["syntheticReceipt"]["eventId"], "mcp-event-1")
         invalid = self.rpc("tools/call", {"name": "droppoint_module_test", "arguments": {"manifest": {}}})[2]
         self.assertTrue(invalid["result"]["isError"])
 
@@ -562,6 +649,21 @@ class HTTPTests(unittest.TestCase):
                         check_refs(child)
             check_refs(schema)
 
+    def test_test_endpoint_event_id_retry_and_conflict(self):
+        value = manifest()
+        request = {"manifest": value, "eventId": "http-event-1"}
+        first = self.request("/api/test", request)[2]
+        retry = self.request("/api/test", request)[2]
+        self.assertFalse(first["syntheticReceipt"]["duplicate"])
+        self.assertTrue(retry["syntheticReceipt"]["duplicate"])
+        self.assertEqual(retry["syntheticReceipt"]["receiptSha512"],
+                         first["syntheticReceipt"]["receiptSha512"])
+        changed = copy.deepcopy(value)
+        changed["purpose"] += " changed"
+        conflict = self.request("/api/test", {
+            "manifest": changed, "eventId": "http-event-1"})[2]
+        self.assertEqual(conflict["errorCode"], "event_id_conflict")
+
     def test_zip_assets_are_whitelisted_with_module_csp_and_no_store(self):
         self.assertIn('href="/zip"', self.request("/", method="GET")[2])
         for path, mime in (("/zip", "text/html"), ("/zip_intake.mjs", "text/javascript")):
@@ -579,6 +681,10 @@ class HTTPTests(unittest.TestCase):
                 hashed = base64.b64encode(hashlib.sha256(code.encode()).digest()).decode()
                 self.assertIn("'sha256-" + hashed + "'", policy)
                 self.assertIn('from "/zip_intake.mjs"', text)
+                self.assertIn("eventId", text)
+                self.assertNotIn("submit_reviewed_modules", text)
+                self.assertNotIn("Host gate dry-run", text)
+                self.assertNotIn("parabola", text.lower())
         for path in ("/zip?upload=x", "/zip_node.html", "/topology.py", "/module_manifest_v2.schema.json",
                      "/../README.md", "/%2e%2e/README.md", "/zip_intake.mjs/../README.md"):
             self.assertEqual(self.request(path, method="GET")[0], 404)

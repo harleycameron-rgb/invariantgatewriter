@@ -289,6 +289,10 @@ class ReviewedQualificationTests(unittest.TestCase):
             schema="module-manifest/2", dependencies=[], proposedPlacements=["local-sandbox"],
             evidence=[{"reference": "module.json", "method": "explicit-declaration"}],
             extractionMethod="explicit-declaration", unresolvedQuestions=[],
+            businessRequirements={"function": "Return the input unchanged.",
+                                 "inputs": [{"name": "value", "type": "string"}],
+                                 "outputs": [{"name": "value", "type": "string"}],
+                                 "acceptanceCases": ["echo-test"]},
         )
         first = self.submit([candidate(module=module)])["results"][0]
         self.assertEqual(first["status"], "success")
@@ -306,6 +310,10 @@ class ReviewedQualificationTests(unittest.TestCase):
         module.update(
             schema="module-manifest/2", dependencies=[], proposedPlacements=[],
             evidence=[], extractionMethod="explicit-declaration", unresolvedQuestions=[],
+            businessRequirements={"function": "Return the input unchanged.",
+                                 "inputs": [{"name": "value", "type": "string"}],
+                                 "outputs": [{"name": "value", "type": "string"}],
+                                 "acceptanceCases": ["echo-test"]},
         )
         module["constraints"] = [{"kind": "unknown-custom-limit", "value": 2**53}]
         qualifier = Mock()
