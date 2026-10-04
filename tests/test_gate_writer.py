@@ -8,7 +8,7 @@ import uuid
 from unittest.mock import patch
 
 from invariantgatewriter import (
-    GateError, GateWriter, QualificationVerifier, SQLiteStore, register_gate_tools,
+    GateError, GateWriter, HostContext, QualificationVerifier, SQLiteStore, register_gate_tools,
 )
 
 
@@ -81,6 +81,9 @@ class WriterTests(unittest.TestCase):
                 patch.object(self.store, "lookup", side_effect=AssertionError):
             result = disabled.dry_run(qualification())
         self.assertTrue(result["dryRun"])
+        self.assertTrue(result["test"])
+        self.assertFalse(result["synthetic"])
+        self.assertFalse(result["liveSubmission"])
         self.assertNotIn("layer", result)
         self.assertNotIn("writtenAt", result)
         self.assertEqual(self.writer.status()["occupiedReceipts"], 0)
@@ -199,6 +202,9 @@ class WriterTests(unittest.TestCase):
             result = self.writer.self_test()
         self.assertTrue(result["passed"])
         self.assertTrue(result["isolated"])
+        self.assertTrue(result["synthetic"])
+        self.assertTrue(result["test"])
+        self.assertFalse(result["liveSubmission"])
         self.assertEqual(len(result["checks"]), 7)
         for check in result["checks"]:
             self.assertTrue(check["synthetic"])
@@ -213,6 +219,29 @@ class WriterTests(unittest.TestCase):
     def test_lookup_validates_identifier(self):
         self.assertIsNone(self.writer.lookup("missing")["receipt"])
         self.assert_error("invalid_qualification_id", self.writer.lookup, "'; DROP TABLE gate_receipts;")
+
+    def test_self_test_setup_failure_has_explicit_safe_checks(self):
+        with patch("invariantgatewriter.writer.SQLiteStore", side_effect=RuntimeError(TEST_KEY.decode())):
+            result = self.writer.self_test()
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["liveSubmission"])
+        self.assertEqual(len(result["checks"]), 7)
+        for check in result["checks"]:
+            self.assertTrue(check["synthetic"])
+            self.assertTrue(check["test"])
+            self.assertFalse(check["passed"])
+            self.assertEqual(check["error"]["code"], "self_test_setup_failed")
+        self.assertNotIn(TEST_KEY.decode(), json.dumps(result))
+
+    def test_self_test_check_failure_has_explicit_safe_result(self):
+        with patch("invariantgatewriter.writer.SQLiteStore.lookup", side_effect=RuntimeError(TEST_KEY.decode())):
+            result = self.writer.self_test()
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["liveSubmission"])
+        for check in result["checks"]:
+            if not check["passed"]:
+                self.assertEqual(check["error"]["code"], "self_test_check_failed")
+        self.assertNotIn(TEST_KEY.decode(), json.dumps(result))
 
     def test_privacy_metadata_only(self):
         self.writer.write(qualification())
@@ -290,11 +319,16 @@ class Host:
             ]
         }
 
-    def tool(self):
+    def tool_names(self):
+        return tuple(self.tools)
+
+    def tool(self, *, name, description):
         def register(function):
-            if function.__name__ in self.tools:
+            if name in self.tools:
                 raise ValueError("duplicate tool")
-            self.tools[function.__name__] = function
+            self.tools[name] = function
+            if not description:
+                raise ValueError("missing description")
             return function
         return register
 
@@ -310,9 +344,12 @@ class AdapterTests(unittest.TestCase):
         )
         self.allowed = False
         self.calls = []
+        self.native_context = object()
+        self.context = HostContext(self.native_context)
 
-        def authorize(name):
-            self.calls.append(name)
+        def authorize(context, permission):
+            self.assertIs(context, self.native_context)
+            self.calls.append(permission)
             return self.allowed
 
         self.legacy = dict(self.host.tools)
@@ -333,45 +370,70 @@ class AdapterTests(unittest.TestCase):
         for name, original in self.legacy.items():
             self.assertIs(self.host.tools[name], original)
 
+    def test_collision_preflight_registers_nothing(self):
+        host = Host()
+        existing_gate_tool = object()
+        host.tools["droppoint_gate_self_test"] = existing_gate_tool
+        before = dict(host.tools)
+        with self.assertRaises(GateError) as caught:
+            register_gate_tools(host, self.writer, lambda context, permission: True)
+        self.assertEqual(caught.exception.code, "tool_name_collision")
+        self.assertEqual(host.tools, before)
+
+    def test_registration_without_registry_inspection_fails_closed(self):
+        host = Host()
+        host.tool_names = None
+        before = dict(host.tools)
+        with self.assertRaises(GateError) as caught:
+            register_gate_tools(host, self.writer, lambda context, permission: True)
+        self.assertEqual(caught.exception.code, "host_registration_unsupported")
+        self.assertEqual(host.tools, before)
+
     def test_authorization_required_for_all_six_tools(self):
         for name, arguments in self.tool_arguments().items():
             with self.subTest(name=name):
                 self.assertEqual(
-                    self.host.tools[name](*arguments), {"error": {"code": "unauthorized"}},
+                    self.host.tools[name](*arguments, context=self.context), {"error": {"code": "unauthorized"}},
                 )
-        self.assertEqual(set(self.calls), set(self.tool_arguments()))
+        self.assertEqual(set(self.calls), {"gate:read", "gate:write", "gate:self_test"})
         self.assertEqual(self.writer.status()["occupiedReceipts"], 0)
         self.allowed = True
         for name, arguments in self.tool_arguments().items():
-            self.assertNotIn("error", self.host.tools[name](*arguments))
+            self.assertNotIn("error", self.host.tools[name](*arguments, context=self.context))
 
     def test_fail_closed_nonboolean_and_exception(self):
         for allowed in [None, 1, "true", {}, False]:
             self.allowed = allowed
             self.assertEqual(
-                self.host.tools["droppoint_gate_status"](), {"error": {"code": "unauthorized"}},
+                self.host.tools["droppoint_gate_status"](context=self.context), {"error": {"code": "unauthorized"}},
             )
         other_host = Host()
 
-        def failing_authorizer(name):
+        def failing_authorizer(context, permission):
             raise RuntimeError(TEST_KEY.decode())
 
         register_gate_tools(other_host, self.writer, failing_authorizer)
         self.assertEqual(
-            other_host.tools["droppoint_gate_status"](), {"error": {"code": "unauthorized"}},
+            other_host.tools["droppoint_gate_status"](context=self.context), {"error": {"code": "unauthorized"}},
         )
 
     def test_caller_cannot_supply_auth_context(self):
         with self.assertRaises(TypeError):
             self.host.tools["droppoint_gate_status"](authorized=True)
+        self.allowed = True
+        self.assertEqual(
+            self.host.tools["droppoint_gate_status"](context={"authorized": True}),
+            {"error": {"code": "unauthorized"}},
+        )
+        self.allowed = False
         envelope = qualification()
         envelope["authorized"] = True
         self.assertEqual(
-            self.host.tools["droppoint_gate_write"](envelope), {"error": {"code": "unauthorized"}},
+            self.host.tools["droppoint_gate_write"](envelope, context=self.context), {"error": {"code": "unauthorized"}},
         )
         self.allowed = True
         self.assertEqual(
-            self.host.tools["droppoint_gate_write"](envelope),
+            self.host.tools["droppoint_gate_write"](envelope, context=self.context),
             {"error": {"code": "invalid_envelope_fields"}},
         )
 
@@ -379,11 +441,11 @@ class AdapterTests(unittest.TestCase):
         self.allowed = True
         envelope = qualification()
         envelope["filename"] = "private-filename"
-        result = self.host.tools["droppoint_gate_write_batch"]([envelope])
+        result = self.host.tools["droppoint_gate_write_batch"]([envelope], context=self.context)
         self.assertNotIn("private-filename", json.dumps(result))
         with patch.object(self.writer, "status", side_effect=RuntimeError(TEST_KEY.decode())):
             self.assertEqual(
-                self.host.tools["droppoint_gate_status"](), {"error": {"code": "internal_error"}},
+                self.host.tools["droppoint_gate_status"](context=self.context), {"error": {"code": "internal_error"}},
             )
 
 

@@ -234,7 +234,10 @@ class GateWriter:
 
     def dry_run(self, qualification):
         _, receipt_hash, x, y = self._verify(qualification)
-        return {"gateId": GATE_ID, "receiptSHA512": receipt_hash, "x": x, "y": y, "dryRun": True}
+        return {
+            "gateId": GATE_ID, "receiptSHA512": receipt_hash, "x": x, "y": y,
+            "dryRun": True, "test": True, "synthetic": False, "liveSubmission": False,
+        }
 
     def write(self, qualification):
         if not self._connected:
@@ -258,10 +261,27 @@ class GateWriter:
 
     def self_test(self):
         """Exercise only private in-memory storage and synthetic receipts."""
-        key = secrets.token_bytes(64)
-        now = int(time.time())
-        verifier = QualificationVerifier(key, {"synthetic-test-policy"}, clock=lambda: now)
-        store = SQLiteStore(":memory:")
+        check_names = (
+            "write", "lookup", "retry", "dedup", "event_content_conflict",
+            "layer_stack_0_through_511_and_overflow", "synthetic_live_rejection",
+        )
+        try:
+            key = secrets.token_bytes(64)
+            now = int(time.time())
+            verifier = QualificationVerifier(key, {"synthetic-test-policy"}, clock=lambda: now)
+            store = SQLiteStore(":memory:")
+        except Exception:
+            return {
+                "synthetic": True, "test": True, "isolated": True, "passed": False,
+                "liveSubmission": False,
+                "checks": [
+                    {
+                        "name": name, "synthetic": True, "test": True, "passed": False,
+                        "error": {"code": "self_test_setup_failed"},
+                    }
+                    for name in check_names
+                ],
+            }
         checks = []
 
         def check(name, operation):
@@ -269,7 +289,10 @@ class GateWriter:
                 passed = operation() is True
             except Exception:
                 passed = False
-            checks.append({"name": name, "synthetic": True, "test": True, "passed": passed})
+            result = {"name": name, "synthetic": True, "test": True, "passed": passed}
+            if not passed:
+                result["error"] = {"code": "self_test_check_failed"}
+            checks.append(result)
 
         def synthetic(event):
             body = {
@@ -338,8 +361,15 @@ class GateWriter:
             check("layer_stack_0_through_511_and_overflow", stack_test)
             check("synthetic_live_rejection", live_rejection_test)
         finally:
-            store.close()
+            try:
+                store.close()
+            except Exception:
+                checks.append({
+                    "name": "cleanup", "synthetic": True, "test": True, "passed": False,
+                    "error": {"code": "self_test_cleanup_failed"},
+                })
         return {
             "synthetic": True, "test": True, "isolated": True,
+            "liveSubmission": False,
             "passed": all(check["passed"] for check in checks), "checks": checks,
         }

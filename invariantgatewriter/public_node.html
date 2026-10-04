@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Public module test node</title>
+<style>body{font:16px system-ui;max-width:70rem;margin:2rem auto;padding:1rem}textarea{width:100%;height:26rem}pre{white-space:pre-wrap;overflow-wrap:anywhere}button{margin:1rem .5rem 0 0}</style>
+<h1>Public module test node</h1>
+<p>Declarations stay transient. Synthetic receipts never authorize live admission. Do not submit credentials.</p>
+<form id="form">
+<label for="manifest">module-manifest/1 declaration</label>
+<textarea id="manifest" spellcheck="false">{
+  "schema": "module-manifest/1",
+  "moduleId": "example.add",
+  "version": "1.0.0",
+  "purpose": "Add two synthetic numbers",
+  "inputs": [{"name":"a","type":"number"},{"name":"b","type":"number"}],
+  "outputs": [{"name":"sum","type":"number"}],
+  "constraints": [{"kind":"nonNegativeNumbers","value":true}],
+  "engineConnections": [{
+    "name":"add", "interface":"numbers.add/1", "required":true,
+    "inputs":[{"name":"a","type":"number"},{"name":"b","type":"number"}],
+    "outputs":[{"name":"sum","type":"number"}]
+  }],
+  "syntheticTests": [{"name":"two-plus-three","connection":"add","inputs":{"a":2,"b":3},"expectedOutputs":{"sum":5}}]
+}</textarea>
+<button type="submit" value="validate">Validate</button>
+<button type="submit" value="connections">Connections</button>
+<button type="submit" value="test">Run synthetic tests</button>
+</form>
+<pre id="result" aria-live="polite"></pre>
+<script>
+document.getElementById("form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const result = document.getElementById("result");
+  result.textContent = "Checking…";
+  try {
+    const manifest = JSON.parse(document.getElementById("manifest").value);
+    const response = await fetch("/api/" + event.submitter.value, {
+      method: "POST", credentials: "omit",
+      headers: {"Content-Type":"application/json"}, body: JSON.stringify(manifest)
+    });
+    result.textContent = JSON.stringify(await response.json(), null, 2);
+  } catch (_) {
+    result.textContent = "Invalid JSON or request failed.";
+  }
+});
+</script>
+</html>
