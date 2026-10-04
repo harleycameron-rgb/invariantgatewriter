@@ -142,6 +142,21 @@ class ReviewedQualificationTests(unittest.TestCase):
         self.assertFalse(next_event["receipt"]["duplicate"])
         self.assertEqual(self.writer.status()["occupiedReceipts"], 2)
 
+    def test_acceptance_flow_write_lookup_identical_retry(self):
+        item = candidate()
+        submission = self.submit([item])["results"][0]
+        self.assertEqual(submission["status"], "success")
+        self.assertFalse(submission["receipt"]["duplicate"])
+        self.assertEqual(self.writer.status()["occupiedReceipts"], 1)
+
+        lookup = self.writer.lookup(item["qualificationId"])["receipt"]
+        self.assertEqual(lookup, submission["receipt"])
+
+        retry = self.submit([item])["results"][0]
+        self.assertEqual(retry["status"], "success")
+        self.assertEqual(retry["receipt"], dict(submission["receipt"], duplicate=True))
+        self.assertEqual(self.writer.status()["occupiedReceipts"], 1)
+
     def test_changed_snapshot_same_event_rejected(self):
         self.submit([candidate()])
         changed = declaration()
