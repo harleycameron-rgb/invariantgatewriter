@@ -347,14 +347,18 @@ recursively expanded.
 | Expansion ratio | 100:1 |
 
 Extraction prefers explicit module declarations; otherwise it identifies
-package boundaries using static metadata. It does not split every file into a
+documented interfaces and package boundaries using static metadata. It does not split every file into a
 module, invent missing contracts or inflate receipt counts. Inferred candidates
 carry unresolved questions; unknown contracts stay unknown. Evidence references
 and extraction methods distinguish declarations from inference.
 
 Use `droppoint.module.json` for explicit declarations (one manifest, or a
 `modules` list). Static package metadata provides inferred candidates when no
-explicit declaration covers that boundary. The small
+explicit declaration covers that boundary. A bounded `droppoint-module` JSON
+fence in `README.md`, or `droppoint.interface.json`, supplies an unconfirmed
+documented-interface candidate with explicit evidence and open confirmation
+questions. Conflicting candidate identities are rejected instead of silently
+choosing one. The small
 [`synthetic_modules.zip`](tests/fixtures/synthetic_modules.zip) fixture exercises
 multiple local candidates; its declarations and synthetic cases are test
 material, not live qualifications.
@@ -380,6 +384,11 @@ Two separate reports prevent confusing declaration identity with compatibility:
 
 - **H:** module ID → canonical declaration SHA-512.
 - **P:** module ID → proposed engine placements and remaining feasible choices.
+
+These rings are not the gate coordinate allocator. A declaration fingerprint
+identifies a snapshot; `receiptSHA512` hashes a signed qualification body for a
+particular event and determines its gate coordinate. Different chronological
+events for the same declaration may therefore have different gate coordinates.
 
 Placement checks compare declared connection interfaces, backend-known
 dependency availability, and inclusion/exclusion constraints. Results record
@@ -415,6 +424,12 @@ nonempty synthetic tests satisfy the documented resolution conditions.
 The common vertex may then represent completion; plotting it by itself proves
 nothing. Partial resolution is a legitimate result, and even local completion
 does not authorize a live gate write.
+
+In version 2 responses, top-level `status` is the placement/model assessment.
+`syntheticReceipt.status` describes the predefined test execution only. Successful
+builtin tests do not override a pending dependency or an incompatible placement.
+Configure dependency availability and engine catalogs only in backend node
+configuration; manifest claims are not proof that a dependency is deployed.
 
 ## Multiple qualification events
 
@@ -452,3 +467,15 @@ identity/placement rings, constraint evidence and the parabola projection.
 Receipt coordinates and stack layers are shown only after an actual successful
 write through a connected authenticated host bridge. Neither the trusted
 qualifier nor that live browser-to-host bridge is connected in this repository.
+
+A deployment can inject the ZIP module's `configureTrustedHostBridge` with
+`qualify_reviewed_module(item)`, `droppoint_gate_dry_run(qualification)` and
+`submit_reviewed_modules(items)` callbacks.
+Each item contains the reviewed `declaration` and stable `qualificationId`.
+The qualifier callback calls the actual trusted backend policy service and
+returns a qualified envelope or a pending/rejected decision; it is not a
+browser signing function. Only a real qualified envelope reaches
+`droppoint_gate_dry_run(qualification)`. The public service does not implement
+these callbacks or carry signing credentials. New-event/retry controls and
+receipt rendering stay disconnected until a trusted host integration supplies
+them.

@@ -9,20 +9,33 @@ body{font:16px system-ui;max-width:72rem;margin:2rem auto;padding:1rem}textarea{
 <h1>Browser-local ZIP inspection</h1>
 <p>ZIPs and repository source never leave this browser. No repository code executes. Only individually reviewed declarations can be sent for synthetic tests. Privacy scanning is fallible: inspect every outgoing field, including evidence paths. Synthetic success is not live acceptance.</p>
 <p>Limits: 8 MiB ZIP, 16 MiB expanded, 256 entries, 1 MiB per file, 100:1 expansion. Nested archives and private paths are excluded without extraction.</p>
+<p>Static documentation: one JSON declaration in a README.md <code>droppoint-module</code> fence (README inspection limited to 64 KiB), or <code>droppoint.interface.json</code>. These remain unconfirmed static interfaces. Explicit declarations take precedence; documentation replaces, never duplicates, its package boundary. Ambiguous documentation and conflicting identity groups are excluded.</p>
 <label>Choose ZIP <input id="archive" type="file" accept=".zip,application/zip"></label>
 <button id="reset" type="button">Close / reset</button>
 <p id="summary" role="status"></p>
 <div id="candidates"></div>
 <h2>Live host</h2>
-<p>Live not connected. This public service has no live gate endpoint. No signing or qualification service is simulated.</p>
+<p id="host-status">Live not connected. This public service has no live gate endpoint. No signing or qualification service is simulated.</p>
 <pre id="live"></pre>
 <script type="module">
-import {inspectZip, validateReviewedManifest, declarationHash, renderConfirmedReceipt} from "/zip_intake.mjs";
+import {inspectZip, validateReviewedManifest, declarationHash, renderConfirmedReceipt, getTrustedHostBridge, onTrustedHostBridgeChange, hostGatePreview} from "/zip_intake.mjs";
 const file = document.querySelector("#archive"), summary = document.querySelector("#summary"), list = document.querySelector("#candidates");
-let generation = 0, controller = null;
+let generation = 0, intakeController = null;
+const events = new Map(), hostControls = new Set(), controllers = new Set();
+function abortRequests() { for (const controller of controllers) controller.abort(); controllers.clear(); }
+function updateHostControls() {
+  const connected = getTrustedHostBridge() !== null;
+  document.querySelector("#host-status").textContent = connected
+    ? "Trusted host adapter installed. Qualification policy and authorization remain host-owned; a connection alone is not admission."
+    : "Live not connected. This public service has no live gate endpoint. No signing or qualification service is simulated.";
+  for (const update of hostControls) update();
+}
+onTrustedHostBridgeChange(updateHostControls);
 function reset() {
-  generation++; controller?.abort(); controller = null;
+  generation++; abortRequests();
+  intakeController?.abort(); intakeController = null;
   file.value = ""; list.replaceChildren(); summary.textContent = ""; document.querySelector("#live").textContent = "";
+  events.clear(); hostControls.clear();
 }
 document.querySelector("#reset").onclick = reset;
 window.addEventListener("pagehide", reset);
@@ -32,12 +45,32 @@ function projection(topology, target) {
   const ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
   svg.setAttribute("viewBox", "0 0 300 220"); svg.setAttribute("role", "img");
   svg.setAttribute("aria-label", "Backend-provided sparse parabola sandbox projection; not capacity");
+  const boundary = document.createElementNS(ns, "polygon"), lower = [];
+  for (let i = 0; i <= 32; i++) {
+    const x = -1 + i / 16, y = Math.max(topology.a * x * x, topology.b * x * x);
+    if (y <= 1) lower.push([150 + x * 125, 200 - y * 175]);
+  }
+  if (lower.length) {
+    const maxX = Math.min(1, 1 / Math.sqrt(Math.max(topology.a, topology.b))), edgeY = Math.max(topology.a, topology.b) * maxX * maxX;
+    const points = [[150 - maxX * 125, 25], [150 - maxX * 125, 200 - edgeY * 175], ...lower, [150 + maxX * 125, 200 - edgeY * 175], [150 + maxX * 125, 25]];
+    boundary.setAttribute("points", points.map(p => p.join(",")).join(" "));
+    boundary.setAttribute("fill", "#dbeedc"); boundary.setAttribute("stroke", "#486"); svg.append(boundary);
+  }
   for (const coefficient of [topology.a, topology.b]) {
     const path = document.createElementNS(ns, "polyline");
     const points = [];
     for (let i = 0; i <= 24; i++) { const x = -1 + i / 12, y = coefficient * x * x; if (y <= 1) points.push(`${150 + x * 125},${200 - y * 175}`); }
     path.setAttribute("points", points.join(" ")); path.setAttribute("fill", "none"); path.setAttribute("stroke", coefficient === topology.a ? "#246" : "#964"); svg.append(path);
   }
+  for (const focus of [topology.focusA, topology.focusB]) {
+    if (!Array.isArray(focus) || focus[0] !== 0 || !Number.isFinite(focus[1]) || focus[1] <= 0) continue;
+    target.append(node("p", `Backend positive focus: (0, ${focus[1]})`));
+    const marker = document.createElementNS(ns, "circle"); marker.setAttribute("cx", "150"); marker.setAttribute("cy", 200 - focus[1] * 175); marker.setAttribute("r", "3"); marker.setAttribute("fill", "#964"); svg.append(marker);
+  }
+  const focusYs = [topology.focusA, topology.focusB].filter(f => Array.isArray(f) && f[0] === 0 && Number.isFinite(f[1]) && f[1] > 0).map(f => f[1]);
+  const top = Math.min(0, 190 - Math.max(1, ...focusYs) * 175);
+  if (Number.isFinite(top)) svg.setAttribute("viewBox", `0 ${top} 300 ${220 - top}`);
+  target.append(node("p", "Sparse cone / parabola sandbox: max(a·x², b·x²) ≤ y ≤ 1, −1 ≤ x ≤ 1. Not storage capacity."));
   const p = topology.completionPoint;
   const x = Array.isArray(p) ? p[0] : p?.x, y = Array.isArray(p) ? p[1] : p?.y;
   if (Number.isFinite(x) && Number.isFinite(y) && Math.abs(x) <= 1 && y <= 1 && y >= Math.max(topology.a * x * x, topology.b * x * x)) {
@@ -48,66 +81,113 @@ function projection(topology, target) {
 }
 function candidate(manifest, epoch) {
   const section = document.createElement("section");
-  section.append(node("h2", `${manifest.moduleId} — ${manifest.extractionMethod === "explicit-declaration" ? "explicit" : "inferred"}`));
+  section.append(node("h2", `${manifest.moduleId} — ${manifest.extractionMethod === "explicit-declaration" ? "explicit" : manifest.extractionMethod === "static-interface" ? "documented static-interface (unconfirmed)" : "inferred package boundary"}`));
   const label = node("label", "Outgoing declaration (edit before review)");
   const area = document.createElement("textarea"); area.spellcheck = false; area.value = JSON.stringify(manifest, null, 2); label.append(area);
   const review = document.createElement("input"); review.type = "checkbox";
   const approval = node("label", " I reviewed every field and explicitly opt in to sending this declaration only."); approval.prepend(review);
   const send = node("button", "Send reviewed declaration for synthetic tests"); send.type = "button"; send.disabled = true;
   const result = document.createElement("pre"), plot = document.createElement("div");
-  review.onchange = () => { send.disabled = !review.checked; };
-  area.oninput = () => { review.checked = false; send.disabled = true; result.textContent = ""; plot.replaceChildren(); };
-  send.onclick = async () => {
-    if (!review.checked || epoch !== generation) return;
-    send.disabled = true;
+  const newEvent = node("button", "Explicitly create a new chronological host event"), preview = node("button", "Host gate dry-run"), submit = node("button", "Submit reviewed event to trusted host");
+  for (const button of [newEvent, preview, submit]) { button.type = "button"; button.disabled = true; }
+  const eventDisplay = node("pre", "Content hash identifies a declaration. An opaque event ID identifies a chronological host event; retries reuse it. Live not connected.");
+  const eventKey = Symbol("candidate-event-metadata");
+  let assessedHash = null, busy = false, testing = false, revision = 0;
+  const controls = () => {
+    const bridge = getTrustedHostBridge(), event = events.get(eventKey);
+    send.disabled = busy || testing || !review.checked;
+    newEvent.disabled = busy || testing || !bridge || !review.checked || !assessedHash;
+    preview.disabled = busy || testing || !review.checked || !assessedHash || event?.hash !== assessedHash || typeof bridge?.droppoint_gate_dry_run !== "function" || typeof bridge?.qualify_reviewed_module !== "function";
+    submit.disabled = busy || testing || !review.checked || !assessedHash || event?.hash !== assessedHash || typeof bridge?.submit_reviewed_modules !== "function";
+  };
+  hostControls.add(controls);
+  review.onchange = () => { send.disabled = !review.checked; controls(); };
+  area.oninput = () => { revision++; review.checked = false; assessedHash = null; send.disabled = true; result.textContent = ""; plot.replaceChildren(); controls(); };
+  newEvent.onclick = () => {
+    if (newEvent.disabled) return;
+    const event = {qualificationId: crypto.randomUUID(), hash: assessedHash};
+    events.set(eventKey, event);
+    eventDisplay.textContent = `Declaration SHA-512: ${event.hash}\nChronological event ID: ${event.qualificationId}\nRetries reuse this event. Only this explicit action creates a new event.`;
+    controls();
+  };
+  async function hostRequest(dryRun) {
     let outgoing = null;
+    const bridge = getTrustedHostBridge(), event = events.get(eventKey);
+    if (!bridge || !review.checked || !event || event.hash !== assessedHash || epoch !== generation) return;
+    const snapshotRevision = revision;
+    busy = true; area.readOnly = true; review.disabled = true; controls();
+    try {
+      outgoing = validateReviewedManifest(JSON.parse(area.value));
+      if (await declarationHash(outgoing) !== event.hash || epoch !== generation || snapshotRevision !== revision || !review.checked) throw new Error("Review changed");
+      const item = {declaration: outgoing, qualificationId: event.qualificationId};
+      const response = dryRun ? await hostGatePreview(bridge, item) : await bridge.submit_reviewed_modules([item]);
+      if (epoch !== generation || snapshotRevision !== revision || bridge !== getTrustedHostBridge()) return;
+      const entry = Array.isArray(response) ? response[0] : response?.results?.[0] ?? response;
+      if (dryRun) {
+        eventDisplay.textContent = `Event: ${event.qualificationId}\nHost gate dry-run status: ${entry?.status ?? (entry?.dryRun === true ? "preview" : "pending")}. Preview only; no live acceptance or stored coordinate claimed.`;
+      } else if (entry?.status === "success") {
+        renderConfirmedReceipt(entry, eventDisplay, {moduleId: outgoing.moduleId, qualificationId: event.qualificationId, moduleSHA512: event.hash});
+      } else {
+        eventDisplay.textContent = `Event: ${event.qualificationId}\nHost status: ${entry?.status === "rejected" ? "rejected" : "pending"}\nNo successful live receipt confirmed.`;
+      }
+    } catch { if (epoch === generation) eventDisplay.textContent = `Event: ${event.qualificationId}\nHost request rejected or not connected. No live receipt confirmed.`; }
+    finally { outgoing = null; busy = false; if (epoch === generation) { area.readOnly = false; review.disabled = false; controls(); } }
+  }
+  preview.onclick = () => hostRequest(true);
+  submit.onclick = () => hostRequest(false);
+  send.onclick = async () => {
+    if (!review.checked || testing || busy || epoch !== generation) return;
+    send.disabled = true; testing = true; area.readOnly = true; review.disabled = true; controls();
+    const snapshotRevision = revision;
+    let outgoing = null, requestController = null;
     try {
       outgoing = validateReviewedManifest(JSON.parse(area.value));
       const hash = await declarationHash(outgoing);
-      if (epoch !== generation || !review.checked) return;
+      if (epoch !== generation || snapshotRevision !== revision || !review.checked) return;
       const body = JSON.stringify(outgoing);
-      controller = new AbortController();
-      const response = await fetch("/api/test", {method: "POST", credentials: "omit", headers: {"Content-Type": "application/json"}, body, signal: controller.signal});
+      requestController = new AbortController(); controllers.add(requestController);
+      const response = await fetch("/api/test", {method: "POST", credentials: "omit", headers: {"Content-Type": "application/json"}, body, signal: requestController.signal});
       const data = await response.json();
-      if (epoch !== generation) return;
+      if (epoch !== generation || snapshotRevision !== revision) return;
       const identity = data.identityRing, placement = data.placementRing;
       const matched = identity?.moduleId === outgoing.moduleId && identity.declarationSha512 === hash;
+      assessedHash = matched && response.ok ? hash : null;
+      controls();
       result.textContent = JSON.stringify({
         H: {[outgoing.moduleId]: hash},
         P: {[outgoing.moduleId]: placement?.proposed ?? outgoing.proposedPlacements},
         feasible: placement?.feasible ?? [],
         status: !response.ok ? "rejection" : matched ? (data.status ?? "pending") : "pending: backend identity not confirmed",
-        syntheticOnly: true, results: data.syntheticResults ?? data.tests ?? data.results ?? [],
+        syntheticOnly: true, syntheticReceipt: data.syntheticReceipt ?? null,
+        results: data.syntheticReceipt?.tests ?? data.syntheticResults ?? data.tests ?? data.results ?? [],
         evidence: data.evidence ?? outgoing.evidence,
         unresolvedConditions: data.unresolvedConditions ?? outgoing.unresolvedQuestions
       }, null, 2);
       plot.replaceChildren(); if (matched) projection(data.topology, plot);
     } catch { if (epoch === generation) result.textContent = "Local validation or synthetic request rejected. No live acceptance."; }
-    finally { outgoing = null; if (epoch === generation) send.disabled = !review.checked; controller = null; }
+    finally {
+      outgoing = null; if (requestController) controllers.delete(requestController); requestController = null; testing = false;
+      if (epoch === generation) { area.readOnly = false; review.disabled = false; send.disabled = !review.checked; controls(); }
+    }
   };
-  section.append(label, approval, send, result, plot); list.append(section);
+  section.append(label, approval, send, result, plot, newEvent, preview, submit, eventDisplay); list.append(section);
+  controls();
 }
 file.onchange = async () => {
-  generation++; controller?.abort(); list.replaceChildren(); const epoch = generation;
+  generation++; abortRequests(); intakeController?.abort(); list.replaceChildren(); events.clear(); hostControls.clear(); const epoch = generation;
   let selected = file.files?.[0], inspection = null;
   file.value = "";
   if (!selected) return;
   summary.textContent = "Inspecting locally…";
+  const intake = new AbortController(); intakeController = intake;
   try {
-    inspection = await inspectZip(selected);
+    inspection = await inspectZip(selected, {signal: intake.signal});
     if (epoch !== generation) return;
     summary.textContent = `${inspection.candidates.length} candidates. Exclusions (counts only): ${JSON.stringify(inspection.exclusions)}. Review is required.`;
     for (const manifest of inspection.candidates) candidate(manifest, epoch);
   } catch { if (epoch === generation) summary.textContent = "ZIP rejected by local safety checks. Nothing uploaded."; }
-  finally { selected = null; if (inspection) inspection.candidates.length = 0; inspection = null; }
+  finally { selected = null; if (inspection) inspection.candidates.length = 0; inspection = null; if (intakeController === intake) intakeController = null; }
 };
-// Host integration only: the trusted host owns verification; never call from public test results.
-export function hostReceiptFromTrustedAdapter(response) {
-  renderConfirmedReceipt(response, document.querySelector("#live"));
-}
-export async function hostGatePreview(bridge, reviewedDeclaration) {
-  if (typeof bridge?.droppoint_gate_dry_run !== "function") throw new Error("Live host not connected");
-  return bridge.droppoint_gate_dry_run(validateReviewedManifest(reviewedDeclaration));
-}
+updateHostControls();
 </script>
 </html>

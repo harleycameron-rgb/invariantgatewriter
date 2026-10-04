@@ -15,14 +15,37 @@ V2_FIELDS = (
 )
 EXTRA_FIELDS = V2_FIELDS[9:]
 EXTRACTION_METHODS = ("explicit-declaration", "package-boundary", "static-interface")
-PACKAGE_NAME = re.compile(r"(?:@[A-Za-z0-9._-]+/)?[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII)
 DIGEST = re.compile(r"[0-9a-f]{128}\Z", re.ASCII)
-EXACT_DEPENDENCY_VERSION = re.compile(
-    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z", re.ASCII,
-)
+
+
+def _exact_dependency_version(version):
+    from .public_node import _is_version
+    if not version.isascii():
+        return False
+    core, build_separator, build = version.partition("+")
+    if build_separator and (not build or any(not part or any(
+            not character.isalnum() and character != "-" for character in part)
+            for part in build.split("."))):
+        return False
+    core, prerelease_separator, prerelease = core.partition("-")
+    if not _is_version(core) or any(len(part) > 1 and part[0] == "0" for part in core.split(".")):
+        return False
+    if prerelease_separator:
+        parts = prerelease.split(".")
+        if any(not part or any(not character.isalnum() and character != "-" for character in part)
+               or part.isdecimal() and len(part) > 1 and part[0] == "0" for part in parts):
+            return False
+    return True
+
+
+def _package_name(name):
+    from .public_node import _is_name
+    if name.startswith("@"):
+        parts = name[1:].split("/")
+        return (len(parts) == 2 and bool(parts[0]) and parts[0].isascii()
+                and all(character.isalnum() or character in "._-" for character in parts[0])
+                and _is_name(parts[1]))
+    return _is_name(name)
 
 
 def _safe_text(value):
@@ -31,7 +54,8 @@ def _safe_text(value):
 
 
 def _safe_reference(reference):
-    if "\\" in reference or ":" in reference or reference.startswith("/"):
+    if (not reference.isascii() or reference.startswith("/")
+            or any(not character.isalnum() and character not in "._/-" for character in reference)):
         return False
     parts = reference.split("/")
     if any(part in ("", ".", "..") for part in parts):
@@ -39,16 +63,18 @@ def _safe_reference(reference):
     for part in parts:
         lowered = part.lower()
         if (lowered.startswith((".env", ".git", "credentials", "secrets", "id_rsa", "id_ed25519"))
-                or lowered in (".ssh", ".aws", ".azure", ".npmrc", ".netrc", ".pypirc")
-                or lowered.endswith((".pem", ".key", ".p12", ".pfx"))
-                or "%" in part):
+                or lowered in ("node_modules", "vendor", ".ssh", ".aws", ".azure", ".npmrc", ".netrc",
+                               ".pypirc", ".config", "home", "user", "users", "private", "personal",
+                               "downloads", "documents", "desktop")
+                or lowered.endswith((".pem", ".key", ".p12", ".pfx", ".jpg", ".jpeg", ".png", ".gif",
+                                     ".mp4", ".mov", ".mp3", ".wav", ".pdf"))):
             return False
-    return True
+    return parts[-1].lower().split(".")[0] not in ("key", "keys")
 
 
 def validate_declaration(manifest):
     """Validate v2 and hash its full canonical JSON; errors contain no input data."""
-    from .public_node import _bounded, _object, _require, _string, _array, _validate_v1, NAME
+    from .public_node import _bounded, _object, _require, _string, _array, _validate_v1, NAME, _is_name
 
     canonical = _bounded(manifest)
     _object(manifest, V2_FIELDS)
@@ -57,8 +83,7 @@ def validate_declaration(manifest):
     def walk(value):
         if type(value) is dict:
             for key, child in value.items():
-                _require(key.isascii() and NAME.fullmatch(key) is not None,
-                         "Invalid object field name.")
+                _require(_is_name(key), "Invalid object field name.")
                 walk(child)
         elif type(value) is list:
             for child in value:
@@ -77,8 +102,9 @@ def validate_declaration(manifest):
     names = set()
     for dependency in manifest["dependencies"]:
         _object(dependency, ("moduleId", "version"))
-        _string(dependency["moduleId"], maximum=128, pattern=PACKAGE_NAME)
-        _require(".." not in dependency["moduleId"], "Invalid dependency name.")
+        _string(dependency["moduleId"], maximum=128)
+        _require(_package_name(dependency["moduleId"]) and ".." not in dependency["moduleId"],
+                 "Invalid dependency name.")
         _string(dependency["version"], maximum=128)
         _require(dependency["moduleId"] not in names, "Duplicate dependency name.")
         names.add(dependency["moduleId"])
@@ -222,7 +248,7 @@ def assess_declaration(manifest, digest, *, test_receipt=None,
     for dependency in manifest["dependencies"]:
         name, version = dependency["moduleId"], dependency["version"]
         details = dict(dependency)
-        exact = EXACT_DEPENDENCY_VERSION.fullmatch(version) is not None
+        exact = _exact_dependency_version(version)
         if not exact:
             check("dependency", "Dependency version range is not resolved by this backend.",
                   pending=True, details=details)
@@ -238,15 +264,22 @@ def assess_declaration(manifest, digest, *, test_receipt=None,
     receipt = test_receipt if type(test_receipt) is dict else {}
     tests = receipt.get("tests", [])
     scope = receipt.get("scope", {})
-    matching = (receipt.get("declarationSha512") == digest and receipt.get("synthetic") is True
+    matching = (receipt.get("schema") == "module-synthetic-receipt/1"
+                and receipt.get("declarationSha512") == digest and receipt.get("synthetic") is True
                 and receipt.get("liveAdmission") is False
-                and type(scope) is dict and scope.get("execution") not in (None, "not_run"))
+                and type(scope) is dict
+                and scope.get("execution") == "backend-defined builtin connection interfaces only")
     executed = (matching and type(tests) is list and bool(tests)
                 and {test.get("name") for test in tests if type(test) is dict}
                 == {test["name"] for test in manifest["syntheticTests"]}
                 and len(tests) == len(manifest["syntheticTests"]))
+    expected = {test["name"]: test["expectedOutputs"] for test in manifest["syntheticTests"]}
     passed = executed and receipt.get("status") == "passed" and all(
-        type(test) is dict and test.get("status") == "passed" for test in tests)
+        type(test) is dict and test.get("status") == "passed"
+        and type(test.get("actualOutputs")) is dict
+        and test["actualOutputs"] == expected[test["name"]]
+        and all(type(actual) is type(expected[test["name"]][name])
+                for name, actual in test["actualOutputs"].items()) for test in tests)
     failed = executed and (receipt.get("status") == "failed" or any(
         type(test) is dict and test.get("status") == "failed" for test in tests))
     check("synthetic-tests", "Executed backend synthetic tests passed." if passed else

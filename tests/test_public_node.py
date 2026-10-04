@@ -1,4 +1,5 @@
 import copy
+import base64
 import hashlib
 import http.client
 import json
@@ -13,7 +14,9 @@ from unittest.mock import patch
 from invariantgatewriter.public_node import (
     MAX_BODY, PublicModuleNode, PublicNodeError, RateLimiter, create_server,
     main, register_module_tools,
+    _validate, _page_policy,
 )
+from invariantgatewriter.topology import SAFE_INTEGER, builtin_engine_catalog, validate_declaration
 
 
 def manifest():
@@ -29,6 +32,127 @@ def manifest():
         "syntheticTests": [{"name": "basic", "connection": "add",
                             "inputs": {"a": 2, "b": 3}, "expectedOutputs": {"sum": 5}}],
     }
+
+
+def manifest_v2():
+    value = manifest()
+    value.update(schema="module-manifest/2", dependencies=[],
+                 proposedPlacements=["numbers", "local-sandbox"],
+                 evidence=[{"reference": "module.json", "method": "explicit-declaration"}],
+                 extractionMethod="explicit-declaration", unresolvedQuestions=[])
+    return value
+
+
+class V2ModuleTests(unittest.TestCase):
+    def test_csp_parser_preserves_literal_script_and_style_content(self):
+        script = 'const value = "<div>&amp;<!-- literal -->";\r\n'
+        style = 'body::after{content:"<script>&amp;"}\n'
+        page = ('<style>' + style + '</style><script\n type="module">' +
+                script + '</script>').encode()
+        policy = _page_policy(page, modules=True)
+        for content in (script, style):
+            digest = base64.b64encode(hashlib.sha256(content.encode()).digest()).decode()
+            self.assertIn("'sha256-" + digest + "'", policy)
+        self.assertNotIn("unsafe-inline", policy)
+
+    def test_validator_entrypoint_hashes_all_v2_fields_without_charge(self):
+        value = manifest_v2()
+        self.assertEqual(_validate(value), validate_declaration(value))
+        self.assertEqual(_validate(value), hashlib.sha512(json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest())
+        value["purpose"] += " changed"
+        self.assertEqual(_validate(value), validate_declaration(value))
+
+    def test_all_operations_attach_rings_but_only_executed_tests_complete(self):
+        node = PublicModuleNode()
+        for action in ("validate", "connections", "test"):
+            value = manifest_v2()
+            result = getattr(node, "droppoint_module_" + action)(value)
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["schema"], "module-manifest/2")
+            self.assertEqual(result["identityRing"]["declarationSha512"], result["declarationSha512"])
+            self.assertEqual(result["placementRing"]["feasible"], ["local-sandbox", "numbers"])
+            self.assertFalse(result["liveAdmission"])
+            self.assertEqual(result["status"], "complete" if action == "test" else "pending")
+            self.assertEqual(result["syntheticReceipt"]["status"], "passed" if action == "test" else "not_run")
+            self.assertEqual(result["topology"]["completionPoint"], [0, 0] if action == "test" else None)
+            self.assertFalse(result["syntheticReceipt"]["scope"]["moduleImplementationExecuted"])
+            self.assertFalse(result["syntheticReceipt"]["scope"]["placementAssessmentIncluded"])
+
+    def test_backend_dependencies_and_catalog_are_not_client_claims(self):
+        value = manifest_v2()
+        value["dependencies"] = [{"moduleId": "@scope/pkg", "version": "1.2.3"}]
+        self.assertEqual(PublicModuleNode().droppoint_module_test(value)["status"], "pending")
+        config = {"@scope/pkg": "1.2.3"}
+        node = PublicModuleNode(available_dependencies=config)
+        config["@scope/pkg"] = "2.0.0"
+        self.assertEqual(node.droppoint_module_test(value)["status"], "complete")
+        self.assertEqual(PublicModuleNode(available_dependencies=config).droppoint_module_test(value)["status"],
+                         "incompatible")
+        self.assertEqual(PublicModuleNode(engine_catalog={}).droppoint_module_test(manifest_v2())["status"],
+                         "incompatible")
+        catalog = builtin_engine_catalog()
+        node = PublicModuleNode(engine_catalog=catalog)
+        catalog.clear()
+        self.assertEqual(node.droppoint_module_test(manifest_v2())["status"], "complete")
+        value["availableDependencies"] = {"@scope/pkg": "1.2.3"}
+        self.assertFalse(node.droppoint_module_test(value)["valid"])
+
+    def test_placement_constraints_resolve_only_in_v2(self):
+        value = manifest_v2()
+        value["constraints"].append({"kind": "includeEngine", "value": "numbers"})
+        result = PublicModuleNode().droppoint_module_test(value)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["placementRing"]["feasible"], ["numbers"])
+        self.assertEqual(result["constraints"][-1]["status"], "satisfied")
+        self.assertEqual(result["syntheticReceipt"]["status"], "passed")
+        self.assertNotIn("includeEngine", result["syntheticReceipt"]["scope"]["checkedConstraints"])
+        value["constraints"].append({"kind": "excludeEngine", "value": "numbers"})
+        result = PublicModuleNode().droppoint_module_test(value)
+        self.assertEqual(result["status"], "incompatible")
+        self.assertEqual(result["constraints"][-1]["status"], "violated")
+        self.assertEqual(result["syntheticReceipt"]["status"], "passed")
+        self.assertFalse(result["syntheticReceipt"]["scope"]["placementAssessmentIncluded"])
+        value["constraints"] = [{"kind": "includeEngine", "value": "unavailable"}]
+        result = PublicModuleNode().droppoint_module_validate(value)
+        self.assertEqual(result["constraints"][-1]["status"], "violated")
+        self.assertEqual(result["status"], "incompatible")
+        old = manifest()
+        old["constraints"].append({"kind": "includeEngine", "value": "numbers"})
+        old_result = PublicModuleNode().droppoint_module_test(old)
+        self.assertEqual(old_result["constraints"][-1]["status"], "unresolved")
+        self.assertNotIn("topology", old_result)
+
+    def test_v2_safe_output_numbers_and_sanitized_invalid_manifests(self):
+        value = manifest_v2()
+        value["syntheticTests"][0]["inputs"] = {"a": SAFE_INTEGER, "b": 1}
+        value["syntheticTests"][0]["expectedOutputs"] = {"sum": SAFE_INTEGER}
+        result = PublicModuleNode().droppoint_module_test(value)
+        self.assertEqual(result["status"], "incompatible")
+        self.assertEqual(result["syntheticReceipt"]["status"], "failed")
+        self.assertNotIn("actualOutputs", result["syntheticReceipt"]["tests"][0])
+        for invalid in (1.0, SAFE_INTEGER + 1, True):
+            value = manifest_v2()
+            value["syntheticTests"][0]["inputs"]["a"] = invalid
+            result = PublicModuleNode().droppoint_module_validate(value)
+            self.assertFalse(result["valid"])
+            self.assertEqual(result["syntheticReceipt"]["status"], "invalid")
+            self.assertNotIn("identityRing", result)
+        value = manifest_v2()
+        value["evidence"][0]["reference"] = "../private-credential"
+        result = PublicModuleNode().droppoint_module_validate(value)
+        self.assertFalse(result["valid"])
+        self.assertNotIn("private-credential", json.dumps(result))
+
+    def test_partial_and_incompatible_candidates_stay_independent(self):
+        node = PublicModuleNode()
+        value = manifest_v2()
+        value["extractionMethod"] = "static-interface"
+        self.assertEqual(node.droppoint_module_test(value)["status"], "pending")
+        value = manifest_v2()
+        value["proposedPlacements"] = ["text"]
+        self.assertEqual(node.droppoint_module_test(value)["status"], "incompatible")
+        self.assertEqual(node.droppoint_module_test(manifest_v2())["status"], "complete")
 
 
 class ModuleTests(unittest.TestCase):
@@ -409,6 +533,69 @@ class HTTPTests(unittest.TestCase):
         invalid = self.rpc("tools/call", {"name": "droppoint_module_test", "arguments": {"manifest": {}}})[2]
         self.assertTrue(invalid["result"]["isError"])
 
+    def test_v2_rest_mcp_and_advertised_local_schema_references(self):
+        value = manifest_v2()
+        for action in ("validate", "connections", "test"):
+            status, _, result = self.request("/api/" + action, value)
+            self.assertEqual(status, 200)
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["status"], "complete" if action == "test" else "pending")
+        reply = self.rpc("tools/call", {
+            "name": "droppoint_module_test", "arguments": {"manifest": value}})[2]["result"]
+        self.assertEqual(reply["structuredContent"]["status"], "complete")
+        self.assertFalse(reply["structuredContent"]["liveAdmission"])
+        for tool in self.rpc("tools/list")[2]["result"]["tools"]:
+            schema = tool["inputSchema"]
+            self.assertEqual(set(schema["$defs"]), {"v1", "v2"})
+            self.assertEqual(schema["$defs"]["v2"]["properties"]["schema"]["const"], "module-manifest/2")
+
+            def check_refs(item):
+                if type(item) is dict:
+                    if "$ref" in item:
+                        target = schema
+                        for component in item["$ref"].removeprefix("#/").split("/"):
+                            target = target[component]
+                    for child in item.values():
+                        check_refs(child)
+                elif type(item) is list:
+                    for child in item:
+                        check_refs(child)
+            check_refs(schema)
+
+    def test_zip_assets_are_whitelisted_with_module_csp_and_no_store(self):
+        self.assertIn('href="/zip"', self.request("/", method="GET")[2])
+        for path, mime in (("/zip", "text/html"), ("/zip_intake.mjs", "text/javascript")):
+            status, headers, text = self.request(path, method="GET")
+            self.assertEqual(status, 200)
+            self.assertTrue(headers["Content-Type"].startswith(mime))
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            policy = headers["Content-Security-Policy"]
+            self.assertIn("script-src 'self' 'sha256-", policy)
+            self.assertNotIn("unsafe-inline", policy)
+            self.assertIn("connect-src 'self'", policy)
+            if path == "/zip":
+                code = re.search(r'<script type="module">(.*?)</script>', text, re.DOTALL)[1]
+                hashed = base64.b64encode(hashlib.sha256(code.encode()).digest()).decode()
+                self.assertIn("'sha256-" + hashed + "'", policy)
+                self.assertIn('from "/zip_intake.mjs"', text)
+        for path in ("/zip?upload=x", "/zip_node.html", "/topology.py", "/module_manifest_v2.schema.json",
+                     "/../README.md", "/%2e%2e/README.md", "/zip_intake.mjs/../README.md"):
+            self.assertEqual(self.request(path, method="GET")[0], 404)
+        self.assertEqual(self.request("/api/write", {}, method="POST")[0], 404)
+
+    def test_zip_assets_preserve_host_origin_credentials_and_rate_checks(self):
+        for path in ("/zip", "/zip_intake.mjs"):
+            for headers, expected in (({"Host": "rebinding.example"}, 403),
+                                      ({"Origin": "https://untrusted.example"}, 403),
+                                      ({"Authorization": "private-credential"}, 400),
+                                      ({"Cookie": "private-credential"}, 400)):
+                status, _, result = self.request(path, method="GET", headers=headers)
+                self.assertEqual(status, expected)
+                self.assertNotIn("private-credential", json.dumps(result))
+        self.node.limiter.client_limit = 1
+        self.assertEqual(self.request("/zip", method="GET")[0], 429)
+
     def test_mcp_rejects_live_tools_and_extra_arguments(self):
         for params in [
             {"name": "tap_gate_submit", "arguments": {}},
@@ -426,7 +613,10 @@ class HTTPTests(unittest.TestCase):
                                   f"Host: localhost:{self.port}\r\n".encode())
         with socket.create_connection(("127.0.0.1", self.port), timeout=3) as connection:
             connection.sendall(request)
-            connection.shutdown(socket.SHUT_WR)
+            try:
+                connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
             chunks = []
             while True:
                 data = connection.recv(65536)

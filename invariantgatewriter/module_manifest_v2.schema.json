@@ -71,11 +71,13 @@
           "reference": {
             "allOf": [
               {"$ref": "#/$defs/text"},
-              {"minLength": 1, "maxLength": 512, "pattern": "^[^/\\\\:%]+(?:/[^/\\\\:%]+)*(?![\\s\\S])"},
+              {"minLength": 1, "maxLength": 512, "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*(?![\\s\\S])"},
               {"not": {"pattern": "(?:^|/)\\.{1,2}(?:/|$)"}},
               {"not": {"pattern": "(?:^|/)(?:\\.[eE][nN][vV]|\\.[gG][iI][tT]|[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]|[sS][eE][cC][rR][eE][tT][sS]|[iI][dD]_[rR][sS][aA]|[iI][dD]_[eE][dD]25519)"}},
               {"not": {"pattern": "(?:^|/)(?:\\.[sS][sS][hH]|\\.[aA][wW][sS]|\\.[aA][zZ][uU][rR][eE]|\\.[nN][pP][mM][rR][cC]|\\.[nN][eE][tT][rR][cC]|\\.[pP][yY][pP][iI][rR][cC])(?:/|$)"}},
-              {"not": {"pattern": "\\.(?:[pP][eE][mM]|[kK][eE][yY]|[pP]12|[pP][fF][xX])(?:/|$)"}}
+              {"not": {"pattern": "(?:^|/)(?:[nN][oO][dD][eE]_[mM][oO][dD][uU][lL][eE][sS]|[vV][eE][nN][dD][oO][rR]|\\.[cC][oO][nN][fF][iI][gG]|[hH][oO][mM][eE]|[uU][sS][eE][rR][sS]?|[pP][rR][iI][vV][aA][tT][eE]|[pP][eE][rR][sS][oO][nN][aA][lL]|[dD][oO][wW][nN][lL][oO][aA][dD][sS]|[dD][oO][cC][uU][mM][eE][nN][tT][sS]|[dD][eE][sS][kK][tT][oO][pP])(?:/|$)"}},
+              {"not": {"pattern": "\\.(?:[pP][eE][mM]|[kK][eE][yY]|[pP]12|[pP][fF][xX]|[jJ][pP][gG]|[jJ][pP][eE][gG]|[pP][nN][gG]|[gG][iI][fF]|[mM][pP]4|[mM][oO][vV]|[mM][pP]3|[wW][aA][vV]|[pP][dD][fF])(?:/|$)"}},
+              {"not": {"pattern": "(?:^|/)[kK][eE][yY][sS]?(?:\\.[^/]*)?(?![\\s\\S])"}}
             ]
           },
           "method": {"allOf": [{"$ref": "#/$defs/text"}, {"minLength": 1, "maxLength": 128}]}

@@ -20,12 +20,12 @@ function supportedConnection(c) {
 }
 export function safePath(name) {
   if (!name || name.includes("\\") || name.includes("\0") || name.startsWith("/") || /^[A-Za-z]:/.test(name) || name.split("/").some((p, i, parts) => p === ".." || p === "." || (!p && i !== parts.length - 1))) fail();
-  if (/[\u0000-\u001f\u007f-\u009f]/u.test(name)) fail();
+  if (/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(name)) fail();
   if (name.split("/").some(p => /:/.test(p) || ["..", "."].includes(p.normalize("NFKC")))) fail();
   return name;
 }
 function privatePath(name) {
-  return excludedPath.test(name) || name.split("/").some(p => /^(?:\.env(?:\.|$)|\.git|node_modules|vendor|\.ssh|\.aws|\.config|home|users?|private|personal)$/i.test(p));
+  return excludedPath.test(name) || name.split("/").some(p => /^(?:\.env|\.git|credentials?|secrets?|id_rsa|id_ed25519)/i.test(p) || /^(?:node_modules|vendor|\.ssh|\.aws|\.azure|\.npmrc|\.netrc|\.pypirc|\.config|home|users?|private|personal)$/i.test(p) || /\.(?:pem|key|p12|pfx|jpg|jpeg|png|gif|mp4|mov|mp3|wav|pdf)$/i.test(p));
 }
 function evidencePath(name) {
   return !privatePath(name) && /^[A-Za-z0-9._/-]+$/.test(name) && !/(?:@|(?:^|\/)(?:downloads|documents|desktop)(?:\/|$))/i.test(name);
@@ -101,13 +101,17 @@ function parseZip(buffer, limits) {
   if (p !== end) fail();
   return {bytes, entries};
 }
-async function inflate(entry, bytes, limits, budget) {
+async function inflate(entry, bytes, limits, budget, signal) {
   let reader, chunks = [], size = 0;
+  const abort = () => { reader?.cancel().catch(() => {}); };
   try {
+    signal?.throwIfAborted();
     const source = new Blob([bytes.subarray(entry.data, entry.data + entry.compressed)]).stream();
     reader = (entry.method === 8 ? source.pipeThrough(new DecompressionStream("deflate-raw")) : source).getReader();
+    signal?.addEventListener("abort", abort, {once: true});
     for (;;) {
       const {value, done} = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       size += value.byteLength;
       if (size > entry.size || size > limits.file || size > entry.compressed * limits.ratio || budget.used + size > limits.expanded) fail();
@@ -121,6 +125,7 @@ async function inflate(entry, bytes, limits, budget) {
     budget.used += size;
     return result;
   } finally {
+    signal?.removeEventListener("abort", abort);
     if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
     chunks.length = 0;
     reader = null;
@@ -131,7 +136,7 @@ function object(value, allowed, required = allowed) {
 }
 function scan(value, depth = 0) {
   if (depth > 12) fail();
-  if (typeof value === "string" && (sensitive.test(value) || value.length > 4096 || /[\ud800-\udfff]/u.test(value.replace(/[\ud800-\udbff][\udc00-\udfff]/g, "")))) fail();
+  if (typeof value === "string" && (sensitive.test(value) || value.length > 4096 || /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(value) || /[\ud800-\udfff]/u.test(value.replace(/[\ud800-\udbff][\udc00-\udfff]/g, "")))) fail();
   if (typeof value === "number" && (!Number.isSafeInteger(value) || Object.is(value, -0))) fail();
   if (Array.isArray(value) && value.length > 256) fail();
   if (value && typeof value === "object") for (const [k, v] of Object.entries(value)) {
@@ -146,7 +151,14 @@ function list(value, allowed, required = allowed) {
 export function validateReviewedManifest(m) {
   object(m, keys);
   scan(m);
-  if (m.schema !== "module-manifest/2" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(m.moduleId) || !/^\d+\.\d+\.\d+$/.test(m.version) || typeof m.purpose !== "string" || !m.purpose || !["explicit-declaration", "package-boundary", "static-interface"].includes(m.extractionMethod)) fail();
+  const asciiKeys = value => {
+    if (value && typeof value === "object") for (const [key, child] of Object.entries(value)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(key)) fail();
+      asciiKeys(child);
+    }
+  };
+  asciiKeys(m);
+  if (m.schema !== "module-manifest/2" || typeof m.moduleId !== "string" || typeof m.version !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(m.moduleId) || !/^\d+\.\d+\.\d+$/.test(m.version) || typeof m.purpose !== "string" || !m.purpose || !["explicit-declaration", "package-boundary", "static-interface"].includes(m.extractionMethod)) fail();
   for (const field of ["inputs", "outputs"]) list(m[field], ["name", "type"]);
   const ports = values => {
     const names = new Set();
@@ -204,6 +216,7 @@ export async function declarationHash(manifest) {
 function explicit(raw, path) {
   object(raw, keys, ["moduleId"]);
   scan(raw);
+  if (typeof raw.moduleId !== "string" || (Object.hasOwn(raw, "version") && typeof raw.version !== "string")) fail();
   if (raw.schema !== undefined && !["module-manifest/1", "module-manifest/2"].includes(raw.schema)) fail();
   const questions = [...(raw.unresolvedQuestions ?? [])];
   if (!raw.purpose) questions.push("What is the module purpose?");
@@ -240,49 +253,101 @@ function inferred(raw, path, toml = false) {
   return validateReviewedManifest({schema: "module-manifest/2", moduleId, version: knownVersion ? raw.version : "0.0.0", purpose: "Purpose not declared", inputs: [], outputs: [], constraints: [], engineConnections: [], syntheticTests: [], dependencies: deps, proposedPlacements: [], evidence: evidencePath(path) ? [{reference: path, method: "package-boundary"}] : [], extractionMethod: "package-boundary", unresolvedQuestions: questions});
 }
 function extract(texts, exclusions) {
-  const candidates = [], declared = new Set(), ids = new Set();
-  const add = m => { if (m) { if (ids.has(m.moduleId) || candidates.length >= LIMITS.files) fail(); ids.add(m.moduleId); candidates.push(m); } };
+  const groups = [], occupied = new Set();
+  const directory = path => path.slice(0, path.lastIndexOf("/") + 1);
+  const declarations = raw => {
+    const items = raw && Object.hasOwn(raw, "modules") ? (object(raw, ["modules"]), raw.modules) : [raw];
+    if (!Array.isArray(items) || !items.length || items.length > LIMITS.files) fail();
+    return items;
+  };
+  const group = (items, path, documented = false) => {
+    // Ambiguous documentation is never split into extra package candidates.
+    if (documented && items.length !== 1) fail();
+    const local = items.map(raw => {
+      const m = explicit(raw, path);
+      if (documented) {
+        m.extractionMethod = "static-interface";
+        m.evidence = evidencePath(path) ? [{reference: path, method: "static-interface"}] : [];
+        m.unresolvedQuestions.push("Confirm this documented interface with an authoritative explicit module declaration.");
+        validateReviewedManifest(m);
+      }
+      return m;
+    });
+    if (new Set(local.map(m => m.moduleId)).size !== local.length) fail();
+    groups.push(local);
+  };
   for (const [path, text] of texts) {
     if (!/(?:^|\/)(?:droppoint\.module\.json|module-manifest(?:\.[^/]*)?\.json)$/.test(path)) continue;
+    occupied.add(directory(path));
     try {
-      const raw = JSON.parse(text);
-      const declarations = raw && Object.hasOwn(raw, "modules") ? (object(raw, ["modules"]), raw.modules) : [raw];
-      if (!Array.isArray(declarations) || !declarations.length || declarations.length > LIMITS.files) fail();
-      const local = declarations.map(r => explicit(r, path));
-      if (new Set(local.map(m => m.moduleId)).size !== local.length || local.some(m => ids.has(m.moduleId)) || candidates.length + local.length > LIMITS.files) fail();
-      local.forEach(add);
-      declared.add(path.slice(0, path.lastIndexOf("/") + 1));
+      group(declarations(JSON.parse(text)), path);
+    } catch { exclusions.invalidDeclarations++; }
+  }
+  // Authoritative declarations win; a documented interface replaces, never duplicates,
+  // its package boundary. Interface files take precedence over README fences.
+  for (const [path, text] of texts) {
+    if (!/(?:^|\/)droppoint\.interface\.json$/.test(path) || occupied.has(directory(path))) continue;
+    occupied.add(directory(path));
+    try { group(declarations(JSON.parse(text)), path, true); }
+    catch { exclusions.invalidDeclarations++; }
+  }
+  for (const [path, text] of texts) {
+    if (!/(?:^|\/)README\.md$/i.test(path) || occupied.has(directory(path))) continue;
+    const fences = [...text.matchAll(/^```droppoint-module[ \t]*\r?\n([\s\S]*?)^```[ \t]*\r?$/gm)];
+    if (!fences.length) continue;
+    occupied.add(directory(path));
+    try {
+      if (fences.length !== 1) fail();
+      group(declarations(JSON.parse(fences[0][1])), path, true);
     } catch { exclusions.invalidDeclarations++; }
   }
   for (const [path, text] of texts) {
-    const dir = path.slice(0, path.lastIndexOf("/") + 1);
-    if (declared.has(dir)) continue;
+    const dir = directory(path);
+    if (occupied.has(dir)) continue;
     try {
-      if (/(?:^|\/)package\.json$/.test(path)) add(inferred(JSON.parse(text), path));
+      if (/(?:^|\/)package\.json$/.test(path)) {
+        const m = inferred(JSON.parse(text), path);
+        if (m) { groups.push([m]); occupied.add(dir); }
+      }
       if (/(?:^|\/)pyproject\.toml$/.test(path) && !texts.has(dir + "package.json")) {
         const section = text.match(/^\[project\]\s*\n([\s\S]*?)(?=^\[|(?![\s\S]))/m)?.[1];
-        if (section) add(inferred({name: section.match(/^name\s*=\s*"([^"\n]*)"\s*$/m)?.[1], version: section.match(/^version\s*=\s*"([^"\n]*)"\s*$/m)?.[1]}, path, true));
+        if (section) {
+          const m = inferred({name: section.match(/^name\s*=\s*"([^"\n]*)"\s*$/m)?.[1], version: section.match(/^version\s*=\s*"([^"\n]*)"\s*$/m)?.[1]}, path, true);
+          if (m) { groups.push([m]); occupied.add(dir); }
+        }
       }
     } catch { exclusions.invalidDeclarations++; }
   }
+  const counts = new Map(), candidates = [];
+  for (const members of groups) for (const m of members) counts.set(m.moduleId, (counts.get(m.moduleId) ?? 0) + 1);
+  for (const members of groups) {
+    // Reject both colliding groups; never quietly retain the first identity claim.
+    if (members.some(m => counts.get(m.moduleId) > 1)) { exclusions.invalidDeclarations++; continue; }
+    candidates.push(...members);
+  }
+  if (candidates.length > LIMITS.files) fail();
   return candidates;
 }
-export async function inspectZip(blob, {limits = LIMITS, onRelease} = {}) {
+export async function inspectZip(blob, {limits = LIMITS, onRelease, signal} = {}) {
   let buffer = null, bytes = null, entries = [], texts = new Map();
   const exclusions = {privatePaths: 0, nestedArchives: 0, sensitiveContent: 0, nonDeclarations: 0, invalidDeclarations: 0};
   try {
+    signal?.throwIfAborted();
     if (!blob || blob.size > limits.archive) fail();
     buffer = await blob.arrayBuffer();
+    signal?.throwIfAborted();
     ({bytes, entries} = parseZip(buffer, limits));
     const budget = {used: 0};
     for (const entry of entries) {
+      signal?.throwIfAborted();
       // Never decode excluded source paths or nested archives.
       if (privatePath(entry.name)) { exclusions.privatePaths++; continue; }
       if (nested.test(entry.name)) { exclusions.nestedArchives++; continue; }
       if (entry.name.endsWith("/")) continue;
-      let expanded = await inflate(entry, bytes, limits, budget);
+      let expanded = await inflate(entry, bytes, limits, budget, signal);
       try {
-        if (!/(?:^|\/)(?:droppoint\.module\.json|module-manifest(?:\.[^/]*)?\.json|package\.json|pyproject\.toml)$/.test(entry.name)) { exclusions.nonDeclarations++; continue; }
+        const readme = /(?:^|\/)README\.md$/i.test(entry.name);
+        if ((!readme && !/(?:^|\/)(?:droppoint\.module\.json|droppoint\.interface\.json|module-manifest(?:\.[^/]*)?\.json|package\.json|pyproject\.toml)$/.test(entry.name)) || (readme && expanded.length > 65536)) { exclusions.nonDeclarations++; continue; }
         const text = decoder.decode(expanded);
         if (sensitive.test(text)) { exclusions.sensitiveContent++; continue; }
         texts.set(entry.name, text);
@@ -295,10 +360,41 @@ export async function inspectZip(blob, {limits = LIMITS, onRelease} = {}) {
   }
 }
 
-// Only a trusted same-origin host adapter may call this hook; it does not verify signatures.
-export function renderConfirmedReceipt(response, target) {
-  const receipt = response?.liveHostReceipt;
-  if (!receipt || response.source !== "trusted-host-adapter" || receipt.confirmed !== true || typeof receipt.receiptId !== "string" || typeof receipt.moduleId !== "string" || typeof receipt.declarationSha512 !== "string" || !/^[a-f0-9]{128}$/.test(receipt.declarationSha512)) fail();
+let trustedHostBridge = null;
+const hostListeners = new Set();
+// A trusted host installs executable adapters, never pasted JSON or public API results.
+export function configureTrustedHostBridge(bridge) {
+  if (bridge !== null && (!bridge || (typeof bridge.droppoint_gate_dry_run !== "function" && typeof bridge.submit_reviewed_modules !== "function"))) fail();
+  trustedHostBridge = bridge;
+  for (const listener of hostListeners) listener(bridge);
+}
+export function getTrustedHostBridge() { return trustedHostBridge; }
+export function onTrustedHostBridgeChange(listener) {
+  hostListeners.add(listener);
+  return () => hostListeners.delete(listener);
+}
+export async function hostGatePreview(bridge, item) {
+  if (bridge !== trustedHostBridge || typeof bridge?.droppoint_gate_dry_run !== "function" || typeof bridge?.qualify_reviewed_module !== "function") return {status: "pending", code: "qualification_service_unconnected"};
+  object(item, ["declaration", "qualificationId"]);
+  validateReviewedManifest(item.declaration);
+  if (typeof item.qualificationId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(item.qualificationId)) fail();
+  const digest = await declarationHash(item.declaration);
+  let qualification = null;
+  try {
+    const result = await bridge.qualify_reviewed_module(item);
+    if (result?.status !== "qualified") return {status: result?.status === "rejected" ? "rejected" : "pending"};
+    qualification = result.qualification;
+    object(qualification, ["schema", "gateId", "qualificationId", "source", "accepted", "policyVersion", "moduleSHA512", "issuedAt", "expiresAt", "signature"]);
+    scan(qualification);
+    if (qualification.schema !== "gate-qualification/1" || qualification.gateId !== "invarianttap-gate-1" || qualification.source !== "qualified-submission" || qualification.accepted !== true || qualification.qualificationId !== item.qualificationId || qualification.moduleSHA512 !== digest || typeof qualification.policyVersion !== "string" || !Number.isSafeInteger(qualification.issuedAt) || !Number.isSafeInteger(qualification.expiresAt) || !/^[a-f0-9]{128}$/.test(qualification.signature) || bridge !== trustedHostBridge) fail();
+    // Only a backend-qualified envelope reaches the gate; the gate verifies its signature.
+    return await bridge.droppoint_gate_dry_run(qualification);
+  } finally { qualification = null; }
+}
+// The caller must be the installed trusted adapter; this hook cannot verify signatures.
+export function renderConfirmedReceipt(response, target, expected) {
+  const receipt = response?.receipt;
+  if (!trustedHostBridge || !expected || response.status !== "success" || response.moduleId !== expected.moduleId || response.qualificationId !== expected.qualificationId || !/^[a-f0-9]{128}$/.test(expected.moduleSHA512) || response.moduleSHA512 !== expected.moduleSHA512 || !receipt || receipt.gateId !== "invarianttap-gate-1" || !/^[a-f0-9]{128}$/.test(receipt.receiptSHA512) || !Number.isSafeInteger(receipt.x) || receipt.x < 0 || receipt.x > 2047 || !Number.isSafeInteger(receipt.y) || receipt.y < 0 || receipt.y > 2047 || !Number.isSafeInteger(receipt.layer) || receipt.layer < 0 || receipt.layer > 511 || !Number.isSafeInteger(receipt.writtenAt) || typeof receipt.duplicate !== "boolean" || receipt.synthetic === true || receipt.dryRun === true) fail();
   scan(receipt);
-  target.textContent = `Host-confirmed receipt (adapter trust required): ${receipt.receiptId}\n${receipt.moduleId} → ${receipt.declarationSha512}`;
+  target.textContent = `Actual host writer receipt (trusted adapter response)\nModule: ${response.moduleId}\nEvent: ${response.qualificationId}\nReceipt hash: ${receipt.receiptSHA512}\nCoordinate: (${receipt.x}, ${receipt.y})\nLayer: ${receipt.layer}\nRetry duplicate: ${receipt.duplicate}`;
 }

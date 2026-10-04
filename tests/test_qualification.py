@@ -112,7 +112,7 @@ class ReviewedQualificationTests(unittest.TestCase):
 
         result = self.submit(items, qualifier)
         self.assertFalse(result["atomic"])
-        self.assertEqual([r["status"] for r in result["results"]], ["qualified", "rejected", "pending", "qualified"])
+        self.assertEqual([r["status"] for r in result["results"]], ["success", "rejected", "pending", "success"])
         self.assertEqual([r["index"] for r in result["results"]], list(range(4)))
         self.assertEqual(self.writer.status()["occupiedReceipts"], 2)
         self.assertEqual(result["results"][1]["code"], "review_required")
@@ -132,7 +132,7 @@ class ReviewedQualificationTests(unittest.TestCase):
         item = candidate()
         first = self.submit([item])["results"][0]
         retry = self.submit([item])["results"][0]
-        self.assertEqual(first["status"], "qualified")
+        self.assertEqual(first["status"], "success")
         self.assertFalse(first["receipt"]["duplicate"])
         self.assertEqual(retry["receipt"], dict(first["receipt"], duplicate=True))
         self.assertEqual(self.writer.status()["occupiedReceipts"], 1)
@@ -243,7 +243,7 @@ class ReviewedQualificationTests(unittest.TestCase):
         result = self.submit([candidate()], writer=writer)["results"][0]
         self.assertEqual((result["status"], result["code"]), ("rejected", "storage_error"))
         result = self.submit([candidate()])["results"][0]
-        self.assertEqual(result["status"], "qualified")
+        self.assertEqual(result["status"], "success")
         self.assertFalse(result["receipt"]["duplicate"])
         writer.write.side_effect = RuntimeError(TEST_KEY.decode())
         result = self.submit([candidate()], writer=writer)["results"][0]
@@ -273,7 +273,7 @@ class ReviewedQualificationTests(unittest.TestCase):
         )._validate) as validate:
             result = self.submit([candidate(module=module)])["results"][0]
             validate.assert_called_once()
-        self.assertEqual(result["status"], "qualified")
+        self.assertEqual(result["status"], "success")
 
     def test_canonical_snapshot_hash_not_changed_by_key_order(self):
         original = declaration()
@@ -282,6 +282,38 @@ class ReviewedQualificationTests(unittest.TestCase):
         second = self.submit([candidate(module=reversed_keys)])["results"][0]
         self.assertEqual(first["moduleSHA512"], second["moduleSHA512"])
         self.assertTrue(second["receipt"]["duplicate"])
+
+    def test_v2_snapshot_uses_full_declaration_hash(self):
+        module = declaration()
+        module.update(
+            schema="module-manifest/2", dependencies=[], proposedPlacements=["local-sandbox"],
+            evidence=[{"reference": "module.json", "method": "explicit-declaration"}],
+            extractionMethod="explicit-declaration", unresolvedQuestions=[],
+        )
+        first = self.submit([candidate(module=module)])["results"][0]
+        self.assertEqual(first["status"], "success")
+        expected = hashlib.sha512(json.dumps(
+            module, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode()).hexdigest()
+        self.assertEqual(first["moduleSHA512"], expected)
+        changed = json.loads(json.dumps(module))
+        changed["evidence"][0]["reference"] = "another-module.json"
+        conflict = self.submit([candidate(module=changed)])["results"][0]
+        self.assertEqual(conflict["code"], "qualification_id_conflict")
+
+    def test_v2_unsafe_integer_rejected_before_qualifier(self):
+        module = declaration()
+        module.update(
+            schema="module-manifest/2", dependencies=[], proposedPlacements=[],
+            evidence=[], extractionMethod="explicit-declaration", unresolvedQuestions=[],
+        )
+        module["constraints"] = [{"kind": "unknown-custom-limit", "value": 2**53}]
+        qualifier = Mock()
+        writer = Mock()
+        result = self.submit([candidate(module=module)], qualifier, writer)["results"][0]
+        self.assertEqual(result["code"], "invalid_declaration")
+        qualifier.assert_not_called()
+        writer.write.assert_not_called()
 
 
 if __name__ == "__main__":

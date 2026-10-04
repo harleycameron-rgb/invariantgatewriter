@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
 from pathlib import Path
 
 
@@ -76,7 +77,19 @@ def _object(value, keys):
 def _string(value, maximum=128, pattern=None):
     _require(type(value) is str and 1 <= len(value) <= maximum, "Invalid string field.")
     if pattern:
-        _require(pattern.fullmatch(value) is not None, "Invalid identifier or version.")
+        valid = (_is_name(value) if pattern is NAME else
+                 _is_version(value) if pattern is VERSION else False)
+        _require(valid, "Invalid identifier or version.")
+
+
+def _is_name(value):
+    return (bool(value) and value.isascii() and value[0].isalnum()
+            and all(character.isalnum() or character in "._-" for character in value))
+
+
+def _is_version(value):
+    parts = value.split(".")
+    return len(parts) == 3 and all(part and part.isascii() and part.isdecimal() for part in parts)
 
 
 def _array(value, maximum):
@@ -189,7 +202,8 @@ def _constraint_findings(manifest, actual=None):
                 continue
             passed = all(v >= 0 for v in relevant)
         elif kind in ("includeEngine", "excludeEngine") and manifest["schema"] == "module-manifest/2":
-            passed = True
+            findings.append({"kind": kind, "status": "deferred"})
+            continue
         else:
             findings.append({"kind": kind, "status": "unresolved"})
             continue
@@ -283,9 +297,13 @@ class PublicModuleNode:
             "execution": "not_run", "moduleImplementationExecuted": False,
             "moduleDeclaredIOExecuted": False, "testedConnections": [],
             "syntheticAssertions": [],
-            "checkedConstraints": [f["kind"] for f in constraints if f["status"] != "unresolved"],
+            "checkedConstraints": [f["kind"] for f in constraints
+                                   if f["status"] in ("satisfied", "violated")],
             "unresolvedConstraints": [f["kind"] for f in constraints if f["status"] == "unresolved"],
         }
+        if manifest["schema"] == "module-manifest/2":
+            scope["placementAssessmentIncluded"] = False
+            scope["placementConstraints"] = "Evaluated separately in top-level status and topology evidence."
         result["syntheticReceipt"] = {
             "schema": "module-synthetic-receipt/1", "declarationSha512": digest,
             "synthetic": True, "liveAdmission": False, "status": "not_run",
@@ -343,10 +361,18 @@ class PublicModuleNode:
     def _assessment(self, manifest, digest, result):
         if manifest["schema"] == "module-manifest/2":
             from .topology import assess_declaration
-            result.update(assess_declaration(
+            assessment = assess_declaration(
                 manifest, digest, test_receipt=result["syntheticReceipt"],
                 available_dependencies=getattr(self, "available_dependencies", None),
-                engine_catalog=getattr(self, "engine_catalog", None)))
+                engine_catalog=getattr(self, "engine_catalog", None))
+            placement_checks = iter(check for check in assessment["evidence"]
+                                    if check["kind"] == "constraint"
+                                    and check["evidence"].get("kind") in ("includeEngine", "excludeEngine"))
+            for finding in result["constraints"]:
+                if finding["status"] == "deferred":
+                    checked = next(placement_checks)
+                    finding["status"] = "violated" if checked["status"] == "incompatible" else "satisfied"
+            result.update(assessment)
         return result
 
     def droppoint_module_validate(self, manifest):
@@ -456,6 +482,66 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         pass
 
 
+def _manifest_input_schema():
+    definitions = {}
+    for version, filename in (("v1", "module_manifest.schema.json"),
+                              ("v2", "module_manifest_v2.schema.json")):
+        schema = json.loads(Path(__file__).with_name(filename).read_text("utf-8"))
+        schema.pop("$id", None)
+        schema.pop("$schema", None)
+
+        def relocate(value):
+            if type(value) is dict:
+                return {key: ("#/$defs/" + version + child[1:]
+                              if key == "$ref" and child.startswith("#/") else relocate(child))
+                        for key, child in value.items()}
+            if type(value) is list:
+                return [relocate(child) for child in value]
+            return value
+
+        definitions[version] = relocate(schema)
+    return {"type": "object", "required": ["manifest"], "additionalProperties": False,
+            "$defs": definitions, "properties": {"manifest": {"oneOf": [
+                {"$ref": "#/$defs/v1"}, {"$ref": "#/$defs/v2"}]}}}
+
+
+class _InlineAssetParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.chunks = {"script": [], "style": []}
+        self.active = None
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.chunks:
+            self.active = tag
+            self.parts = []
+
+    def handle_data(self, data):
+        if self.active is not None:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == self.active:
+            self.chunks[tag].append("".join(self.parts).encode("utf-8"))
+            self.active = None
+            self.parts = []
+
+
+def _page_policy(page, *, modules=False):
+    parser = _InlineAssetParser()
+    parser.feed(page.decode("utf-8"))
+    parser.close()
+    _require(parser.active is None, "Invalid static asset.")
+    hashes = {tag: " ".join("'sha256-" + base64.b64encode(
+        hashlib.sha256(chunk).digest()).decode("ascii") + "'" for chunk in chunks)
+        for tag, chunks in parser.chunks.items()}
+    scripts = ("'self' " if modules else "") + hashes["script"]
+    return (f"default-src 'self'; script-src {scripts}; style-src {hashes['style']}; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+            "object-src 'none'; form-action 'self'")
+
+
 def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
                   allowed_hosts=None, allowed_origins=None, max_connections=32):
     """Create a bounded public server with explicit transport trust boundaries.
@@ -467,15 +553,15 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
     """
     node = node if node is not None else PublicModuleNode()
     page = Path(__file__).with_name("public_node.html").read_bytes()
-    script = re.search(rb"<script>(.*?)</script>", page, re.DOTALL).group(1)
-    style = re.search(rb"<style>(.*?)</style>", page, re.DOTALL).group(1)
-    script_hash = base64.b64encode(hashlib.sha256(script).digest()).decode("ascii")
-    style_hash = base64.b64encode(hashlib.sha256(style).digest()).decode("ascii")
-    content_policy = (
-        f"default-src 'self'; script-src 'sha256-{script_hash}'; "
-        f"style-src 'sha256-{style_hash}'; connect-src 'self'; "
-        "frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"
-    )
+    zip_page = Path(__file__).with_name("zip_node.html").read_bytes()
+    content_policy = _page_policy(page)
+    zip_policy = _page_policy(zip_page, modules=True)
+    assets = {
+        "/": (page, "text/html; charset=utf-8", content_policy),
+        "/zip": (zip_page, "text/html; charset=utf-8", zip_policy),
+        "/zip_intake.mjs": (Path(__file__).with_name("zip_intake.mjs").read_bytes(),
+                            "text/javascript; charset=utf-8", zip_policy),
+    }
     hosts = set()
     origins = set()
 
@@ -489,15 +575,15 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
         def log_message(self, *args):
             pass
 
-        def _send(self, status, payload=None, html=False):
-            raw = page if html else b"" if payload is None else json.dumps(
+        def _send(self, status, payload=None, asset=None):
+            raw = asset[0] if asset is not None else b"" if payload is None else json.dumps(
                 payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "text/html; charset=utf-8" if html else "application/json")
+            self.send_header("Content-Type", asset[1] if asset is not None else "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", content_policy)
+            self.send_header("Content-Security-Policy", asset[2] if asset is not None else content_policy)
             self.send_header("Connection", "close")
             if status == 429:
                 self.send_header("Retry-After", "60")
@@ -537,7 +623,11 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
 
         def do_GET(self):
             if self._charge() and self._trusted_target() and self._anonymous():
-                self._send(200, html=True) if self.path == "/" else self._send(404, {"error": "Not found."})
+                asset = assets.get(self.path)
+                if asset is None:
+                    self._send(404, {"error": "Not found."})
+                else:
+                    self._send(200, asset=asset)
 
         def do_POST(self):
             if not self._charge() or not self._trusted_target() or not self._anonymous():
@@ -614,11 +704,8 @@ def create_server(host="127.0.0.1", port=8080, node=None, source_identity=None,
             elif method == "ping" and not params:
                 result = {}
             elif method == "tools/list" and not params:
-                schema = json.loads(Path(__file__).with_name("module_manifest.schema.json").read_text("utf-8"))
                 result = {"tools": [{"name": name, "description": TOOL_DESCRIPTIONS[name],
-                                    "inputSchema": {"type": "object", "required": ["manifest"],
-                                                    "$defs": schema["$defs"],
-                                                    "properties": {"manifest": schema}, "additionalProperties": False}}
+                                    "inputSchema": _manifest_input_schema()}
                                    for name in TOOL_NAMES]}
             elif method == "tools/call":
                 if (set(params) != {"name", "arguments"} or params["name"] not in TOOL_NAMES

@@ -42,7 +42,7 @@ def submit_reviewed_modules(items, writer, qualifier, authorize, context):
 
     Returns {"atomic": False, "results": [...]}. Results include index/status,
     validated moduleId/qualificationId/moduleSHA512 when available, and either
-    a receipt (qualified) or a safe code (pending/rejected). Successful writes
+    a receipt (success) or a safe code (pending/rejected). Successful writes
     remain committed when another item fails. Gate errors become per-item
     rejected results; retry transient storage failures with the original ID.
     """
@@ -130,5 +130,5 @@ def submit_reviewed_modules(items, writer, qualifier, authorize, context):
         except Exception:
             result["code"] = "writer_error"
             continue
-        result.update(status="qualified", receipt=receipt)
+        result.update(status="success", receipt=receipt)
     return {"atomic": False, "results": results}

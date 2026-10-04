@@ -7,7 +7,7 @@ from pathlib import Path
 
 from invariantgatewriter.public_node import PublicModuleNode, PublicNodeError
 from invariantgatewriter.topology import (
-    EXTRA_FIELDS, MAPPING_VERSION, SAFE_INTEGER, assess_declaration,
+    MAPPING_VERSION, SAFE_INTEGER, assess_declaration,
     builtin_engine_catalog, declaration_topology, validate_declaration,
 )
 
@@ -31,11 +31,7 @@ def manifest():
 
 
 def receipt(value):
-    base = {key: item for key, item in value.items() if key not in EXTRA_FIELDS}
-    base["schema"] = "module-manifest/1"
-    result = PublicModuleNode().droppoint_module_test(base)["syntheticReceipt"]
-    result["declarationSha512"] = validate_declaration(value)
-    return result
+    return PublicModuleNode().droppoint_module_test(value)["syntheticReceipt"]
 
 
 def assess(value, tested=False, **kwargs):
@@ -122,11 +118,15 @@ class TopologyTests(unittest.TestCase):
         digest = validate_declaration(value)
         for field, invalid in [("declarationSha512", "0" * 128), ("synthetic", False),
                                ("liveAdmission", True), ("tests", []),
+                               ("schema", "client-claim"),
                                ("scope", {"execution": "not_run"})]:
             proof = receipt(value)
             proof[field] = invalid
             result = assess_declaration(value, digest, test_receipt=proof)
             self.assertEqual(result["status"], "pending")
+        proof = receipt(value)
+        proof["tests"][0].pop("actualOutputs")
+        self.assertEqual(assess_declaration(value, digest, test_receipt=proof)["status"], "pending")
         value["syntheticTests"] = []
         self.assertEqual(assess(value, tested=True)["status"], "pending")
         value = manifest()
@@ -281,7 +281,9 @@ class V2ValidationTests(unittest.TestCase):
         for path in ("/etc/passwd", "../module.json", "a/../module.json", "a//b", "./module.json",
                      "C:\\file", "https://host/file", ".env", "src/.env.local", ".git/config",
                      ".ssh/config", ".aws/config", "credentials.json", "secrets.txt",
-                     "key.pem", "x%2fy"):
+                     "key.pem", "x%2fy", "a/．．/module.json", "home/package.json",
+                     "users/name/module.json", "keys.json", ".config/module.json", "Downloads/module.json",
+                     "assets/private.pdf", "profile.PNG", "資料/module.json"):
             value = manifest()
             value["evidence"][0]["reference"] = path
             with self.assertRaisesRegex(PublicNodeError, "Unsafe evidence reference"):
