@@ -8,6 +8,9 @@ The public module test node is a separate entry point for declarative manifests.
 It validates declarations and runs predefined synthetic operations, not uploaded
 code. Its receipts are synthetic, unsigned and never enable live gate admission.
 
+To collaborate on this repository with ChatGPT, open
+[ChatGPT Codex](https://chatgpt.com/codex) and connect this GitHub repository.
+
 ### Contents
 
 - [Connection status](#connection-status)
