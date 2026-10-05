@@ -108,6 +108,28 @@ IDs and policy versions use `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Module hashes a
 signatures must be 128 lowercase hexadecimal characters. Future-issued receipts
 and invalid timestamp ranges are rejected too.
 
+### Keyed envelopes (`gate-qualification/2`)
+
+`/2` adds one signed field, `keyId` (same identifier rules as event IDs), and is
+verified by `KeyringVerifier` against a registry of `keyId → key`:
+
+| Key type | Algorithm | Publishable | Notes |
+| --- | --- | --- | --- |
+| `Ed25519PublicKey(raw32)` | Ed25519 (RFC 8032) | Yes | Anyone holding the public key can check receipts; nobody can forge them without the issuer's private key. Needs the optional `cryptography` package (`requirements-ed25519.txt`). |
+| `HmacSha512Key(secret)` | HMAC-SHA512 | No | Same trust model as `/1`, but with a key ID for rotation. |
+
+The registry fixes each key's algorithm, so an envelope cannot choose its own
+algorithm. Several keys can be live at once; retiring a key means removing it.
+Signatures are 128 lowercase hex characters for both algorithms. The receipt
+hash covers `keyId` but never the signature. `legacy_hmac_key=` keeps
+accepting `/1` envelopes during migration; without it `/1` is rejected with
+`legacy_schema_disabled`. A keyring holding only Ed25519 public keys
+(`publicly_verifiable` is `True`; `public_keys()` lists them) contains no
+secrets and can be run independently to audit receipts.
+
+Both verifiers accept `max_clock_skew=` (integer seconds, 0–300, default 0),
+which widens both edges of the `issuedAt`/`expiresAt` window by that amount.
+
 ## Privacy and credentials
 
 **No raw media retained; receipt metadata retained.**

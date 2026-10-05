@@ -394,9 +394,12 @@ export async function hostGatePreview(bridge, item) {
     const result = await bridge.qualify_reviewed_module(item);
     if (result?.status !== "qualified") return {status: result?.status === "rejected" ? "rejected" : "pending"};
     qualification = result.qualification;
-    object(qualification, ["schema", "gateId", "qualificationId", "source", "accepted", "policyVersion", "moduleSHA512", "issuedAt", "expiresAt", "signature"]);
+    const v1 = ["schema", "gateId", "qualificationId", "source", "accepted", "policyVersion", "moduleSHA512", "issuedAt", "expiresAt", "signature"];
+    object(qualification, [...v1, "keyId"], v1);
     scan(qualification);
-    if (qualification.schema !== "gate-qualification/1" || qualification.gateId !== "invarianttap-gate-1" || qualification.source !== "qualified-submission" || qualification.accepted !== true || qualification.qualificationId !== item.qualificationId || qualification.moduleSHA512 !== digest || typeof qualification.policyVersion !== "string" || !Number.isSafeInteger(qualification.issuedAt) || !Number.isSafeInteger(qualification.expiresAt) || !/^[a-f0-9]{128}$/.test(qualification.signature) || bridge !== trustedHostBridge) fail();
+    const keyed = Object.hasOwn(qualification, "keyId");
+    // /1 is HMAC-only and never carries keyId; /2 must carry a registry keyId.
+    if (qualification.schema !== (keyed ? "gate-qualification/2" : "gate-qualification/1") || (keyed && (typeof qualification.keyId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(qualification.keyId))) || qualification.gateId !== "invarianttap-gate-1" || qualification.source !== "qualified-submission" || qualification.accepted !== true || qualification.qualificationId !== item.qualificationId || qualification.moduleSHA512 !== digest || typeof qualification.policyVersion !== "string" || !Number.isSafeInteger(qualification.issuedAt) || !Number.isSafeInteger(qualification.expiresAt) || !/^[a-f0-9]{128}$/.test(qualification.signature) || bridge !== trustedHostBridge) fail();
     // Only a backend-qualified envelope reaches the gate; the gate verifies its signature.
     return await bridge.droppoint_gate_dry_run(qualification);
   } finally { qualification = null; }

@@ -16,7 +16,11 @@ FIELDS = frozenset({
     "policyVersion", "moduleSHA512", "issuedAt", "expiresAt", "signature",
 })
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+FIELDS_V2 = FIELDS | {"keyId"}
+SCHEMA_V1 = "gate-qualification/1"
+SCHEMA_V2 = "gate-qualification/2"
 HEX512 = re.compile(r"[0-9a-f]{128}\Z")
+MAX_CLOCK_SKEW = 300
 
 
 class GateError(Exception):
@@ -45,25 +49,80 @@ def _coordinate(receipt_hash):
     return int.from_bytes(digest[:2], "big") % 2048, int.from_bytes(digest[2:4], "big") % 2048
 
 
+def _skew(value):
+    if type(value) is not int or not 0 <= value <= MAX_CLOCK_SKEW:
+        raise GateError("invalid_verifier_configuration")
+    return value
+
+
+def _policies(supported_policies):
+    if isinstance(supported_policies, (str, bytes)):
+        raise GateError("invalid_verifier_configuration")
+    try:
+        policies = frozenset(supported_policies)
+    except TypeError:
+        raise GateError("invalid_verifier_configuration") from None
+    if not policies or any(not isinstance(p, str) or not IDENTIFIER.fullmatch(p) for p in policies):
+        raise GateError("invalid_verifier_configuration")
+    return policies
+
+
+def _check_body(body, expected_source, policies, now, skew):
+    """Validate every signed field except the signature itself.
+
+    ``skew`` widens both edges of the validity window by at most
+    MAX_CLOCK_SKEW seconds to tolerate clock drift between issuer and gate.
+    """
+    if body["gateId"] != GATE_ID:
+        raise GateError("invalid_envelope")
+    _identifier(body["qualificationId"])
+    if body["source"] != expected_source:
+        raise GateError("invalid_source")
+    if body["accepted"] is not True:
+        raise GateError("not_accepted")
+    if not isinstance(body["policyVersion"], str) or body["policyVersion"] not in policies:
+        raise GateError("unsupported_policy")
+    if not isinstance(body["moduleSHA512"], str) or not HEX512.fullmatch(body["moduleSHA512"]):
+        raise GateError("invalid_module_hash")
+    issued, expires = body["issuedAt"], body["expiresAt"]
+    if type(issued) is not int or type(expires) is not int or not 0 <= issued < expires <= 2**63 - 1:
+        raise GateError("invalid_timestamps")
+    if issued > now + skew:
+        raise GateError("not_yet_valid")
+    if expires <= now - skew:
+        raise GateError("expired_receipt")
+
+
+def _signature_hex(envelope):
+    signature = envelope["signature"]
+    if not isinstance(signature, str) or not HEX512.fullmatch(signature):
+        raise GateError("invalid_signature")
+    return signature
+
+
+def _receipt(body, canonical):
+    receipt_hash = hashlib.sha512(canonical).hexdigest()
+    x, y = _coordinate(receipt_hash)
+    return body["qualificationId"], receipt_hash, x, y
+
+
 class QualificationVerifier:
-    """Verify HMAC-SHA512 receipts using backend-provisioned key material.
+    """Verify ``gate-qualification/1`` HMAC-SHA512 envelopes.
 
     The signature is lowercase hex HMAC over UTF-8 canonical JSON of all
     envelope fields except signature. Provision keys out of band; this API
-    exposes no signing function.
+    exposes no signing function. HMAC is symmetric: whoever can verify can
+    also sign, so /1 receipts are verifiable only by the key holder. Use
+    KeyringVerifier with Ed25519 keys for publicly verifiable /2 envelopes.
     """
 
-    def __init__(self, key, supported_policies, clock=time.time):
+    def __init__(self, key, supported_policies, clock=time.time, *, max_clock_skew=0):
         if not isinstance(key, bytes) or len(key) < 32:
             raise GateError("invalid_verifier_configuration")
-        if isinstance(supported_policies, (str, bytes)):
-            raise GateError("invalid_verifier_configuration")
-        policies = frozenset(supported_policies)
-        if not policies or any(not isinstance(p, str) or not IDENTIFIER.fullmatch(p) for p in policies):
-            raise GateError("invalid_verifier_configuration")
         self._key = key
-        self._policies = policies
+        self._policies = _policies(supported_policies)
         self._clock = clock
+        self._skew = _skew(max_clock_skew)
 
     def verify(self, envelope):
         return self._verify(envelope, "qualified-submission")
@@ -72,35 +131,138 @@ class QualificationVerifier:
         if not isinstance(envelope, dict) or set(envelope) != FIELDS:
             raise GateError("invalid_envelope_fields")
         body = {name: envelope[name] for name in FIELDS if name != "signature"}
-        if body["schema"] != "gate-qualification/1" or body["gateId"] != GATE_ID:
+        if body["schema"] != SCHEMA_V1:
             raise GateError("invalid_envelope")
-        _identifier(body["qualificationId"])
-        if body["source"] != expected_source:
-            raise GateError("invalid_source")
-        if body["accepted"] is not True:
-            raise GateError("not_accepted")
-        if not isinstance(body["policyVersion"], str) or body["policyVersion"] not in self._policies:
-            raise GateError("unsupported_policy")
-        if not isinstance(body["moduleSHA512"], str) or not HEX512.fullmatch(body["moduleSHA512"]):
-            raise GateError("invalid_module_hash")
-        issued, expires = body["issuedAt"], body["expiresAt"]
-        if type(issued) is not int or type(expires) is not int or not 0 <= issued < expires <= 2**63 - 1:
-            raise GateError("invalid_timestamps")
-        now = int(self._clock())
-        if issued > now:
-            raise GateError("not_yet_valid")
-        if expires <= now:
-            raise GateError("expired_receipt")
-        signature = envelope["signature"]
-        if not isinstance(signature, str) or not HEX512.fullmatch(signature):
-            raise GateError("invalid_signature")
+        _check_body(body, expected_source, self._policies, int(self._clock()), self._skew)
+        signature = _signature_hex(envelope)
         canonical = _canonical(body)
         expected = hmac.new(self._key, canonical, hashlib.sha512).hexdigest()
         if not hmac.compare_digest(signature, expected):
             raise GateError("invalid_signature")
-        receipt_hash = hashlib.sha512(canonical).hexdigest()
-        x, y = _coordinate(receipt_hash)
-        return body["qualificationId"], receipt_hash, x, y
+        return _receipt(body, canonical)
+
+
+class HmacSha512Key:
+    """Shared secret (>= 32 bytes) for a keyring entry. Private: backend only."""
+
+    algorithm = "hmac-sha512"
+    public = False
+
+    def __init__(self, secret):
+        if not isinstance(secret, bytes) or len(secret) < 32:
+            raise GateError("invalid_verifier_configuration")
+        self._secret = secret
+
+    def verify(self, signature_hex, message):
+        expected = hmac.new(self._secret, message, hashlib.sha512).hexdigest()
+        return hmac.compare_digest(signature_hex, expected)
+
+    def __repr__(self):
+        return "HmacSha512Key(<redacted>)"
+
+
+class Ed25519PublicKey:
+    """Ed25519 (RFC 8032) verification key: 32 raw bytes, safe to publish.
+
+    Requires the optional ``cryptography`` package. Signatures are 64 bytes,
+    carried as 128 lowercase hex characters like HMAC-SHA512 tags.
+    """
+
+    algorithm = "ed25519"
+    public = True
+
+    def __init__(self, raw):
+        if not isinstance(raw, bytes) or len(raw) != 32:
+            raise GateError("invalid_verifier_configuration")
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+        except ImportError:
+            raise GateError("ed25519_unavailable") from None
+        try:
+            self._key = ed25519.Ed25519PublicKey.from_public_bytes(raw)
+        except Exception:
+            raise GateError("invalid_verifier_configuration") from None
+        self.raw = raw
+
+    @classmethod
+    def from_hex(cls, value):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise GateError("invalid_verifier_configuration")
+        return cls(bytes.fromhex(value))
+
+    def verify(self, signature_hex, message):
+        from cryptography.exceptions import InvalidSignature
+        try:
+            self._key.verify(bytes.fromhex(signature_hex), message)
+        except (InvalidSignature, ValueError):
+            return False
+        return True
+
+    def __repr__(self):
+        return "Ed25519PublicKey(" + self.raw.hex() + ")"
+
+
+class KeyringVerifier:
+    """Verify ``gate-qualification/2`` envelopes against a key registry.
+
+    /2 adds a signed ``keyId``. The registry, not the envelope, fixes each
+    key's algorithm, so a sender cannot choose the algorithm (no algorithm
+    confusion). Several keys may be live at once for rotation; retiring a
+    key is removing its entry. The receipt hash covers keyId but never the
+    signature. ``legacy_hmac_key`` optionally keeps accepting /1 envelopes
+    during migration. A keyring holding only Ed25519PublicKey entries holds
+    no secrets and can be run by anyone to check receipts independently.
+    """
+
+    def __init__(self, keys, supported_policies, clock=time.time, *,
+                 max_clock_skew=0, legacy_hmac_key=None):
+        if not isinstance(keys, dict) or not keys:
+            raise GateError("invalid_verifier_configuration")
+        for key_id, key in keys.items():
+            if not isinstance(key_id, str) or not IDENTIFIER.fullmatch(key_id):
+                raise GateError("invalid_verifier_configuration")
+            if not isinstance(key, (HmacSha512Key, Ed25519PublicKey)):
+                raise GateError("invalid_verifier_configuration")
+        self._keys = dict(keys)
+        self._policies = _policies(supported_policies)
+        self._clock = clock
+        self._skew = _skew(max_clock_skew)
+        self._legacy = None if legacy_hmac_key is None else QualificationVerifier(
+            legacy_hmac_key, self._policies, clock, max_clock_skew=max_clock_skew)
+
+    @property
+    def publicly_verifiable(self):
+        return all(key.public for key in self._keys.values()) and self._legacy is None
+
+    def public_keys(self):
+        """keyId -> hex for publishable keys only; secrets are never listed."""
+        return {key_id: key.raw.hex() for key_id, key in sorted(self._keys.items()) if key.public}
+
+    def verify(self, envelope):
+        return self._verify(envelope, "qualified-submission")
+
+    def _verify(self, envelope, expected_source):
+        if isinstance(envelope, dict) and set(envelope) == FIELDS:
+            if self._legacy is None:
+                raise GateError("legacy_schema_disabled")
+            return self._legacy._verify(envelope, expected_source)
+        if not isinstance(envelope, dict) or set(envelope) != FIELDS_V2:
+            raise GateError("invalid_envelope_fields")
+        body = {name: envelope[name] for name in FIELDS_V2 if name != "signature"}
+        if body["schema"] != SCHEMA_V2:
+            raise GateError("invalid_envelope")
+        key_id = body["keyId"]
+        if not isinstance(key_id, str) or not IDENTIFIER.fullmatch(key_id):
+            raise GateError("invalid_key_id")
+        key = self._keys.get(key_id)
+        if key is None:
+            raise GateError("unknown_key_id")
+        _check_body(body, expected_source, self._policies, int(self._clock()), self._skew)
+        signature = _signature_hex(envelope)
+        canonical = _canonical(body)
+        if not key.verify(signature, canonical):
+            raise GateError("invalid_signature")
+        return _receipt(body, canonical)
 
 
 class SQLiteStore:

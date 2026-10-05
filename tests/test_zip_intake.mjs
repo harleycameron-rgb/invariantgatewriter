@@ -247,3 +247,27 @@ test("host dry-run never passes a manifest as qualification or invents an envelo
   assert.equal(calls, 1);
   configureTrustedHostBridge(null);
 });
+test("host dry-run accepts keyed /2 envelopes and rejects schema/keyId mismatches", async () => {
+  const {candidates: [m]} = await inspectZip(zip([explicitFile]));
+  const item = {declaration: m, qualificationId: "opaque-event-v2"};
+  const base = {gateId: "invarianttap-gate-1", qualificationId: item.qualificationId, source: "qualified-submission", accepted: true, policyVersion: "test-policy", moduleSHA512: await declarationHash(m), issuedAt: 1720000000, expiresAt: 1720000100, signature: "a".repeat(128)};
+  let envelope = null, calls = 0;
+  const bridge = {
+    qualify_reviewed_module: async () => ({status: "qualified", qualification: envelope}),
+    droppoint_gate_dry_run: async qualification => { calls++; assert.equal(qualification, envelope); return {dryRun: true}; }
+  };
+  configureTrustedHostBridge(bridge);
+  envelope = {...base, schema: "gate-qualification/2", keyId: "ed-2026-10"};
+  assert.deepEqual(await hostGatePreview(bridge, item), {dryRun: true});
+  for (const bad of [
+    {...base, schema: "gate-qualification/2"},
+    {...base, schema: "gate-qualification/1", keyId: "ed-2026-10"},
+    {...base, schema: "gate-qualification/2", keyId: "../ed"},
+    {...base, schema: "gate-qualification/2", keyId: ""},
+    {...base, schema: "gate-qualification/2", keyId: 7},
+    {...base, schema: "gate-qualification/2", keyId: "ed-2026-10", alg: "none"},
+    {...base, schema: "gate-qualification/2", keyId: "ed-2026-10", signature: "A".repeat(128)}
+  ]) { envelope = bad; await assert.rejects(hostGatePreview(bridge, item)); }
+  assert.equal(calls, 1);
+  configureTrustedHostBridge(null);
+});
