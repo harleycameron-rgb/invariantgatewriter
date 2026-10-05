@@ -1,0 +1,3 @@
+# Optional: enables Ed25519 keys in KeyringVerifier (gate-qualification/2).
+# Pinned for a reproducible container image; any cryptography>=42 works.
+cryptography==50.0.2

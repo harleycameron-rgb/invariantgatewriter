@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 
-from .writer import FIELDS, GateError
+from .writer import FIELDS, FIELDS_V2, GateError
 
 
 _EVENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -113,7 +113,7 @@ def submit_reviewed_modules(items, writer, qualifier, authorize, context):
             result["code"] = "invalid_qualifier_response"
             continue
         envelope = decision["qualification"]
-        if type(envelope) is not dict or set(envelope) != FIELDS:
+        if type(envelope) is not dict or set(envelope) not in (FIELDS, FIELDS_V2):
             result["code"] = "invalid_qualification_envelope"
             continue
         if envelope["moduleSHA512"] != declaration_hash:
