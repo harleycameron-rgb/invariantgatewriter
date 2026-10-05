@@ -115,7 +115,7 @@ verified by `KeyringVerifier` against a registry of `keyId → key`:
 
 | Key type | Algorithm | Publishable | Notes |
 | --- | --- | --- | --- |
-| `Ed25519PublicKey(raw32)` | Ed25519 (RFC 8032) | Yes | Anyone holding the public key can check receipts; nobody can forge them without the issuer's private key. Needs the optional `cryptography` package (`requirements-ed25519.txt`). |
+| `Ed25519PublicKey(raw32)` | Ed25519 (RFC 8032) | Yes | Anyone holding the public key can check receipts; nobody can forge them without the issuer's private key. Needs the optional `cryptography` package (`requirements-ed25519.txt`; installed in the Docker image). |
 | `HmacSha512Key(secret)` | HMAC-SHA512 | No | Same trust model as `/1`, but with a key ID for rotation. |
 
 The registry fixes each key's algorithm, so an envelope cannot choose its own
@@ -325,7 +325,11 @@ request capture at the proxy as well as the application to preserve transient
 processing.
 
 No hosting target or deployment configuration is present in this repository.
-The included Dockerfile runs the actual public-node entrypoint:
+The included Dockerfile runs the actual public-node entrypoint. It installs the
+pinned `requirements-ed25519.txt` from wheels only (no compiler, no build
+scripts) and checks at build time that Ed25519 works, so `/2` keyrings with
+`Ed25519PublicKey` entries are available in the container. It runs as the
+non-root user 65532.
 
 ```sh
 docker build -t invariantgatewriter .
